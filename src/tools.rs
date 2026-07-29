@@ -354,7 +354,8 @@ fn tail_chars(s: &str, max: usize) -> String {
 
 static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     // CSI (incl. private ?2004h/l), OSC terminated by BEL or ST.
-    regex::Regex::new("\u{1b}\\[[0-9;?]*[ -/]*[@-~]|\u{1b}\\][^\u{7}\u{1b}]*(?:\u{7}|\u{1b}\\\\)").unwrap()
+    regex::Regex::new("\u{1b}\\[[0-9;?]*[ -/]*[@-~]|\u{1b}\\][^\u{7}\u{1b}]*(?:\u{7}|\u{1b}\\\\)")
+        .unwrap()
 });
 
 /// Wrap SFTP create/open failures: name the missing parent directory when
@@ -576,8 +577,11 @@ impl SshMcp {
                     .map_err(internal)?;
             }
             w.data_bytes(
-                format!(" rc=$?; stty echo; PS1=$__spm_ps1; printf '\\n__SPM_{}_%d__\\n' $rc\n", tok)
-                    .into_bytes(),
+                format!(
+                    " rc=$?; stty echo; PS1=$__spm_ps1; printf '\\n__SPM_{}_%d__\\n' $rc\n",
+                    tok
+                )
+                .into_bytes(),
             )
             .await
             .map_err(internal)?;
@@ -628,7 +632,10 @@ impl SshMcp {
             output
         };
         // Post-strip residue (CRs that followed removed escape sequences).
-        let output = output.trim_start_matches(['\r', '\n']).trim_end().to_string();
+        let output = output
+            .trim_start_matches(['\r', '\n'])
+            .trim_end()
+            .to_string();
         let truncated = output.len() > p.max_output_bytes as usize;
         let output = tail_chars(&output, p.max_output_bytes as usize);
         self.audit.log(
