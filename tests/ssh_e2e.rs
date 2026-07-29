@@ -45,7 +45,23 @@ fn run_docker(args: &[&str]) -> String {
 }
 
 fn start_container() -> (Container, u16) {
-    run_docker(&["build", "-q", "-t", "spm-e2e", "tests/docker"]);
+    // Build best-effort: Docker Hub may be unreachable; a cached image is fine.
+    let built = Command::new("docker")
+        .args(["build", "-q", "-t", "spm-e2e", "tests/docker"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !built {
+        let inspect = Command::new("docker")
+            .args(["image", "inspect", "spm-e2e"])
+            .output()
+            .unwrap();
+        assert!(
+            inspect.status.success(),
+            "docker build failed and no cached spm-e2e image"
+        );
+        eprintln!("docker build failed; using cached spm-e2e image");
+    }
     let id = run_docker(&["run", "-d", "--rm", "-P", "spm-e2e"]);
     let port_line = run_docker(&["port", &id, "22/tcp"]);
     let port: u16 = port_line.rsplit(':').next().unwrap().parse().unwrap();
@@ -430,6 +446,17 @@ async fn e2e() {
         err.message.contains("file_read"),
         "11g: upload guard, got {err}"
     );
+
+    // Scenario 12: heredoc and multi-line commands survive ssh_run (newline-joined sentinel).
+    let r = run(&mcp, &id, "cat << EOF\nhello spm\nEOF").await;
+    assert_eq!(r.exit_code, Some(0), "12: heredoc exit code, got {:?}", r);
+    assert!(r.output.contains("hello spm"), "12: heredoc output, got {:?}", r.output);
+    let r = run(&mcp, &id, "cd /tmp\npwd").await;
+    assert!(r.output.contains("/tmp"), "12: multi-line output, got {:?}", r.output);
+    let r = run(&mcp, &id, "pwd").await;
+    assert!(r.output.contains("/tmp"), "12: cwd still persists after multi-line, got {:?}", r.output);
+    let r = run(&mcp, &id, "cd /\nfalse").await;
+    assert_eq!(r.exit_code, Some(1), "12: exit code of last line, got {:?}", r);
 
     // Scenario 10: audit log — records commands, never the password.
     mcp.ssh_close(Parameters(sid(&id))).await.unwrap();

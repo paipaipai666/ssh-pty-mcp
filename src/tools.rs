@@ -472,7 +472,10 @@ impl SshMcp {
         let _io = session.io_lock.lock().await;
         let start = session.shared.inner.lock().stream.end_offset();
         let tok = format!("{:08x}", rand::random::<u32>());
-        let cmd = format!("{}; printf '\\n__SPM_{}_%d__\\n' $?\n", p.command, tok);
+        // Newline-join, not `;`-join: the tty line buffer executes the marker
+        // line after the command completes, so heredocs and multi-line
+        // commands survive intact ($? still reflects the command).
+        let cmd = format!("{}\nprintf '\\n__SPM_{}_%d__\\n' $?\n", p.command, tok);
         {
             let w = session.writer.lock().await;
             w.data_bytes(cmd.into_bytes()).await.map_err(internal)?;
