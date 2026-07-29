@@ -145,6 +145,10 @@ pub struct SshRunParams {
     /// Keep at most this many bytes of output (tail). Default 65536.
     #[serde(default = "default_max_output")]
     pub max_output_bytes: u64,
+    /// Strip ANSI escape sequences (colors, readline artifacts) from output.
+    /// Default true; set false to preserve colors/control sequences.
+    #[serde(default = "default_true")]
+    pub strip_ansi: bool,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -153,6 +157,8 @@ pub struct SshRunOut {
     pub exit_code: Option<i64>,
     pub timed_out: bool,
     pub truncated: bool,
+    /// Absolute stream offset at capture; pass to ssh_expect(from_offset).
+    pub stream_offset: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -165,6 +171,8 @@ pub struct SshTypeParams {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct SeqOut {
     pub seq: u64,
+    /// Absolute stream offset at this moment; pass to ssh_expect(from_offset).
+    pub stream_offset: u64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -191,10 +199,15 @@ pub struct SshExpectParams {
     pub session_id: String,
     /// Regex to wait for.
     pub pattern: String,
-    /// "stream" (default): match raw output arriving after this call.
+    /// "stream" (default): match raw output arriving after from_offset.
     /// "screen": match the rendered terminal screen.
     #[serde(default = "default_stream")]
     pub mode: String,
+    /// Stream offset to start matching from — use the stream_offset returned
+    /// by ssh_type/ssh_press/ssh_run to avoid missing output that arrived
+    /// between the triggering action and this call. Default: current end.
+    #[serde(default)]
+    pub from_offset: Option<u64>,
     #[serde(default = "default_expect_timeout")]
     pub timeout_ms: u64,
     #[serde(default = "default_max_output")]
@@ -339,6 +352,26 @@ fn tail_chars(s: &str, max: usize) -> String {
     s[start..].to_string()
 }
 
+static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // CSI (incl. private ?2004h/l), OSC terminated by BEL or ST.
+    regex::Regex::new("\u{1b}\\[[0-9;?]*[ -/]*[@-~]|\u{1b}\\][^\u{7}\u{1b}]*(?:\u{7}|\u{1b}\\\\)").unwrap()
+});
+
+/// Wrap SFTP create/open failures: name the missing parent directory when
+/// that is the actual cause (raw SFTP "no such file" is ambiguous).
+fn create_error<E: std::fmt::Display>(e: E, real: &str) -> McpError {
+    let msg = e.to_string();
+    if msg.to_lowercase().contains("no such file")
+        && let Some((parent, _)) = real.rsplit_once('/')
+        && !parent.is_empty()
+    {
+        return invalid(format!(
+            "cannot create {real}: parent directory does not exist ({parent})"
+        ));
+    }
+    internal(msg)
+}
+
 /// Read-before-write guard: overwrite of an existing non-empty file requires
 /// full read coverage tagged with the current (size, mtime) fingerprint.
 fn guard_check(session: &Session, real: &str, fp: Fingerprint, tool: &str) -> Result<(), McpError> {
@@ -470,22 +503,91 @@ impl SshMcp {
             ));
         }
         let _io = session.io_lock.lock().await;
+        // Let any in-flight output/typing settle (avoids scaffolding colliding
+        // with a line readline has not accepted yet).
+        let _ = session::wait_screen(
+            &session.shared,
+            None,
+            session::WaitMode::Quiet,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .await;
         let start = session.shared.inner.lock().stream.end_offset();
         let tok = format!("{:08x}", rand::random::<u32>());
-        // Newline-join, not `;`-join: the tty line buffer executes the marker
-        // line after the command completes, so heredocs and multi-line
-        // commands survive intact ($? still reflects the command).
-        let cmd = format!("{}\nprintf '\\n__SPM_{}_%d__\\n' $?\n", p.command, tok);
+        // Echo-toggle handshake (event-driven, no fixed sleeps):
+        //   1. write `stty -echo` + PRE marker (leading space: not recorded in
+        //      shell history); when PRE appears, stty has executed and the tty
+        //      ECHO flag is off
+        //   2. deliver the command — paste-wrapped when the shell advertised
+        //      bracketed paste, so the shell PARSER handles heredocs instead
+        //      of per-line readline reads (the byte-eating race)
+        //   3. scaffold line (leading space, echo off → invisible, unrecorded)
+        //      captures rc BEFORE `stty echo` clobbers $?, restores echo so
+        //      interactive readline works between commands; if the command
+        //      hangs, an agent ctrl+c kills it and the queued scaffold runs
+        let pre_marker = format!("__SPM_PRE_{tok}__");
         {
             let w = session.writer.lock().await;
-            w.data_bytes(cmd.into_bytes()).await.map_err(internal)?;
+            // %s indirection: the echoed PRE line contains the format string,
+            // only the real printf output contains the marker — the wait can
+            // no longer return early on the echo (which would race stty).
+            // PS1 is blanked (saved/restored via $__spm_ps1) so prompt redraws
+            // cannot pollute the captured output region.
+            w.data_bytes(
+                format!(" __spm_ps1=$PS1; PS1=; stty -echo; printf '__SPM_PRE_%s__\\n' {tok}\n")
+                    .into_bytes(),
+            )
+            .await
+            .map_err(internal)?;
+        }
+        let pre_ok = session::wait_stream_contains(
+            &session.shared,
+            start,
+            pre_marker.as_bytes(),
+            Duration::from_millis(p.timeout_ms.min(5000)),
+        )
+        .await;
+        if !pre_ok {
+            return Err(internal(
+                "shell did not acknowledge echo toggle (busy or non-POSIX); retry or use ssh_type/ssh_expect",
+            ));
+        }
+        // Let the post-PRE prompt redraw finish so it cannot leak into the
+        // captured output region.
+        let _ = session::wait_screen(
+            &session.shared,
+            None,
+            session::WaitMode::Quiet,
+            Duration::from_millis(150),
+            Duration::from_secs(2),
+        )
+        .await;
+        let cmd_start = session.shared.inner.lock().stream.end_offset();
+        {
+            let w = session.writer.lock().await;
+            if session.bracketed_paste {
+                w.data_bytes(format!("\u{1b}[200~{}\u{1b}[201~\n", p.command).into_bytes())
+                    .await
+                    .map_err(internal)?;
+            } else {
+                w.data_bytes(format!("{}\n", p.command).into_bytes())
+                    .await
+                    .map_err(internal)?;
+            }
+            w.data_bytes(
+                format!(" rc=$?; stty echo; PS1=$__spm_ps1; printf '\\n__SPM_{}_%d__\\n' $rc\n", tok)
+                    .into_bytes(),
+            )
+            .await
+            .map_err(internal)?;
         }
 
         let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
         let found = loop {
             {
                 let st = session.shared.inner.lock();
-                if let Some(hit) = find_marker(&st.stream, start, &tok) {
+                if let Some(hit) = find_marker(&st.stream, cmd_start, &tok) {
                     break Some(hit);
                 }
                 if st.eof {
@@ -499,12 +601,13 @@ impl SshMcp {
             let _ = tokio::time::timeout(remaining, session.shared.notify.notified()).await;
         };
 
-        let (output, exit_code, timed_out) = {
+        let (output, exit_code, timed_out, stream_offset) = {
             let st = session.shared.inner.lock();
-            let (bytes, _, _) = st.stream.read(start);
-            match found {
+            let (bytes, _, _) = st.stream.read(cmd_start);
+            let offset = st.stream.end_offset();
+            let (out, rc, to) = match found {
                 Some((marker_abs, rc)) => {
-                    let end = (marker_abs - start) as usize;
+                    let end = (marker_abs - cmd_start) as usize;
                     let mut out =
                         String::from_utf8_lossy(&bytes[..end.min(bytes.len())]).into_owned();
                     while out.starts_with('\r') || out.starts_with('\n') {
@@ -516,8 +619,16 @@ impl SshMcp {
                     let out = String::from_utf8_lossy(&bytes).into_owned();
                     (out.trim_end().to_string(), None, true)
                 }
-            }
+            };
+            (out, rc, to, offset)
         };
+        let output = if p.strip_ansi {
+            ANSI_RE.replace_all(&output, "").into_owned()
+        } else {
+            output
+        };
+        // Post-strip residue (CRs that followed removed escape sequences).
+        let output = output.trim_start_matches(['\r', '\n']).trim_end().to_string();
         let truncated = output.len() > p.max_output_bytes as usize;
         let output = tail_chars(&output, p.max_output_bytes as usize);
         self.audit.log(
@@ -530,6 +641,7 @@ impl SshMcp {
             exit_code,
             timed_out,
             truncated,
+            stream_offset,
         }))
     }
 
@@ -552,9 +664,11 @@ impl SshMcp {
             "ssh_type",
             serde_json::json!({"chars": char_count}),
         );
-        Ok(Json(SeqOut {
-            seq: session.shared.seq(),
-        }))
+        let (seq, stream_offset) = {
+            let st = session.shared.inner.lock();
+            (st.seq, st.stream.end_offset())
+        };
+        Ok(Json(SeqOut { seq, stream_offset }))
     }
 
     #[tool(
@@ -573,9 +687,11 @@ impl SshMcp {
         }
         self.audit
             .log(&session.id, "ssh_press", serde_json::json!({"key": p.key}));
-        Ok(Json(SeqOut {
-            seq: session.shared.seq(),
-        }))
+        let (seq, stream_offset) = {
+            let st = session.shared.inner.lock();
+            (st.seq, st.stream.end_offset())
+        };
+        Ok(Json(SeqOut { seq, stream_offset }))
     }
 
     #[tool(
@@ -631,7 +747,9 @@ impl SshMcp {
                 )));
             }
         };
-        let start = session.shared.inner.lock().stream.end_offset();
+        let start = p
+            .from_offset
+            .unwrap_or_else(|| session.shared.inner.lock().stream.end_offset());
         let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
 
         let (matched, text, captures, timed_out) = loop {
@@ -710,7 +828,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Returns the current rendered screen from the server-side terminal model — no SSH round-trip. Use wait='quiet' after ssh_press/ssh_type with the returned seq as since_seq; wait='change' returns on the first new byte; wait='none' snapshots immediately. On timeout returns the current screen with timed_out=true."
+        description = "Returns the current rendered screen from the server-side terminal model — no SSH round-trip. The screen legitimately contains prior output (a real terminal keeps it until cleared): detect WHAT CHANGED with since_seq + wait, never by diffing screen text yourself. Typical loop: press/type -> ssh_screen(wait='quiet', since_seq=<returned seq>) -> decide. wait='change' returns on the first new byte; wait='none' snapshots immediately. On timeout returns the current screen with timed_out=true."
     )]
     pub async fn ssh_screen(
         &self,
@@ -795,7 +913,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Write a remote text file via SFTP. Prefer this over opening vim/nano in the terminal. mode=overwrite requires having read the full current file via file_read first — the server enforces this; partial reads are rejected with the missing byte ranges. mode=append is always allowed (non-destructive). Parent directory must exist."
+        description = "Write a remote text file via SFTP. Prefer this over opening vim/nano in the terminal. mode=overwrite requires having read the full current file via file_read first — the server enforces this; partial reads are rejected with the missing byte ranges. overwrite on a NOT-YET-EXISTING file is allowed without any read. mode=append is always allowed and creates the file if missing. Parent directory must exist."
     )]
     pub async fn file_write(
         &self,
@@ -826,11 +944,19 @@ impl SshMcp {
             }
         }
         let mut file = if overwrite {
-            sftp.create(&real).await.map_err(internal)?
+            sftp.create(&real)
+                .await
+                .map_err(|e| create_error(e, &real))?
         } else {
-            let mut f = sftp.open(&real).await.map_err(internal)?;
-            f.seek(std::io::SeekFrom::End(0)).await.map_err(internal)?;
-            f
+            // CREAT|APPEND|WRITE: create-if-missing, writes forced to end.
+            sftp.open_with_flags(
+                &real,
+                russh_sftp::protocol::OpenFlags::CREATE
+                    | russh_sftp::protocol::OpenFlags::APPEND
+                    | russh_sftp::protocol::OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| create_error(e, &real))?
         };
         file.write_all(p.content.as_bytes())
             .await
@@ -871,7 +997,10 @@ impl SshMcp {
         let mut local = tokio::fs::File::open(&p.local_path)
             .await
             .map_err(|e| invalid(format!("cannot open local file {}: {e}", p.local_path)))?;
-        let mut remote = sftp.create(&real).await.map_err(internal)?;
+        let mut remote = sftp
+            .create(&real)
+            .await
+            .map_err(|e| create_error(e, &real))?;
         let bytes = tokio::io::copy(&mut local, &mut remote)
             .await
             .map_err(internal)?;

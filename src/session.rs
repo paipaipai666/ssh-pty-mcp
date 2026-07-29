@@ -88,6 +88,10 @@ pub struct Session {
     pub write_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Shared with the pump task: set false on EOF/Close or ssh_close.
     pub alive: Arc<AtomicBool>,
+    /// Remote shell advertised readline bracketed paste (`\x1b[?2004h`) at
+    /// open. ssh_run pastes the user command as one buffer when true — the
+    /// shell parser (not per-line readline reads) handles heredocs.
+    pub bracketed_paste: bool,
     pub pump: tokio::task::JoinHandle<()>,
 }
 
@@ -251,26 +255,35 @@ pub async fn wait_stream_contains(
 
 /// Find `\n__SPM_<tok>_<rc>__` in the stream at/after `from`.
 /// Returns `(abs offset of the line break preceding the marker, exit_code)`.
+/// Scans ALL occurrences: with tty echo on, the echoed printf line itself
+/// contains `__SPM_<tok>_` followed by `%d__` — that candidate is invalid
+/// (no digits) and must not poison the search for the real marker output.
 pub fn find_marker(buf: &RingBuf, from: u64, tok: &str) -> Option<(u64, i64)> {
     let (bytes, _, _) = buf.read(from);
     let pat = format!("__SPM_{tok}_");
-    let pos = bytes.windows(pat.len()).position(|w| w == pat.as_bytes())?;
-    let rest = &bytes[pos + pat.len()..];
-    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
-    if digits == 0 {
-        return None; // marker not fully arrived yet
+    let mut search_from = 0;
+    while let Some(rel) = bytes
+        .get(search_from..)?
+        .windows(pat.len())
+        .position(|w| w == pat.as_bytes())
+    {
+        let pos = search_from + rel;
+        let rest = &bytes[pos + pat.len()..];
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        let valid = digits > 0 && rest.len() >= digits + 2 && &rest[digits..digits + 2] == b"__";
+        if valid {
+            let rc: i64 = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
+            let mut start = pos;
+            if start >= 2 && &bytes[start - 2..start] == b"\r\n" {
+                start -= 2;
+            } else if start >= 1 && bytes[start - 1] == b'\n' {
+                start -= 1;
+            }
+            return Some((from + start as u64, rc));
+        }
+        search_from = pos + 1;
     }
-    if rest.len() < digits + 2 || &rest[digits..digits + 2] != b"__" {
-        return None;
-    }
-    let rc: i64 = std::str::from_utf8(&rest[..digits]).ok()?.parse().ok()?;
-    let mut start = pos;
-    if start >= 2 && &bytes[start - 2..start] == b"\r\n" {
-        start -= 2;
-    } else if start >= 1 && bytes[start - 1] == b'\n' {
-        start -= 1;
-    }
-    Some((from + start as u64, rc))
+    None
 }
 
 // ── Read-before-write coverage ──────────────────────────────────────────────
@@ -379,6 +392,19 @@ mod tests {
         b.push(b"cd34_127__\n");
         let (_, rc) = find_marker(&b, 0, "ab12cd34").unwrap();
         assert_eq!(rc, 127);
+    }
+
+    #[test]
+    fn echoed_printf_line_does_not_poison_search() {
+        // With tty echo on, the echoed marker line contains __SPM_<tok>_%d__
+        // (invalid candidate) before the real marker output arrives.
+        let mut b = RingBuf::default();
+        b.push(b"printf '\\n__SPM_deadbeef_%d__\\n' $?\r\n\r\n__SPM_deadbeef_0__\r\n");
+        let (off, rc) = find_marker(&b, 0, "deadbeef").unwrap();
+        assert_eq!(rc, 0);
+        // marker_start points at the \r\n before the REAL marker output,
+        // i.e. past the echoed line
+        assert!(off > 30, "should skip the echoed candidate, got {off}");
     }
 
     #[tokio::test(start_paused = true)]

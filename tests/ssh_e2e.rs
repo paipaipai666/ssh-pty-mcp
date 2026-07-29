@@ -12,61 +12,9 @@ use ssh_pty_mcp::connect::{self, ConnectParams, HostKeyPolicy};
 use ssh_pty_mcp::session::{SessionManager, ShellKind};
 use ssh_pty_mcp::tools::*;
 
-struct Container {
-    id: String,
-}
-
-impl Drop for Container {
-    fn drop(&mut self) {
-        let _ = Command::new("docker").args(["rm", "-f", &self.id]).status();
-    }
-}
-
-fn docker_ok() -> bool {
-    Command::new("docker")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn run_docker(args: &[&str]) -> String {
-    let out = Command::new("docker")
-        .args(args)
-        .output()
-        .expect("spawn docker");
-    assert!(
-        out.status.success(),
-        "docker {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-fn start_container() -> (Container, u16) {
-    // Build best-effort: Docker Hub may be unreachable; a cached image is fine.
-    let built = Command::new("docker")
-        .args(["build", "-q", "-t", "spm-e2e", "tests/docker"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !built {
-        let inspect = Command::new("docker")
-            .args(["image", "inspect", "spm-e2e"])
-            .output()
-            .unwrap();
-        assert!(
-            inspect.status.success(),
-            "docker build failed and no cached spm-e2e image"
-        );
-        eprintln!("docker build failed; using cached spm-e2e image");
-    }
-    let id = run_docker(&["run", "-d", "--rm", "-P", "spm-e2e"]);
-    let port_line = run_docker(&["port", &id, "22/tcp"]);
-    let port: u16 = port_line.rsplit(':').next().unwrap().parse().unwrap();
-    (Container { id }, port)
-}
+#[path = "common/mod.rs"]
+mod common;
+use common::{docker_ok, ssh_open_params, start_container};
 
 fn params(port: u16) -> ConnectParams {
     ConnectParams {
@@ -82,23 +30,6 @@ fn params(port: u16) -> ConnectParams {
         cols: 120,
         rows: 32,
         connect_timeout: Duration::from_secs(5),
-    }
-}
-
-fn ssh_open_params(port: u16) -> SshOpenParams {
-    SshOpenParams {
-        host: "127.0.0.1".into(),
-        port: Some(port),
-        user: Some("test".into()),
-        password: Some("testpass".into()),
-        private_key: None,
-        passphrase: None,
-        use_agent: false,
-        use_ssh_config: false,
-        host_key_policy: "off".into(),
-        cols: 120,
-        rows: 32,
-        connect_timeout_ms: 5000,
     }
 }
 
@@ -127,6 +58,7 @@ async fn run(mcp: &SshMcp, id: &str, command: &str) -> SshRunOut {
         command: command.into(),
         timeout_ms: 30000,
         max_output_bytes: 65536,
+        strip_ansi: true,
     }))
     .await
     .unwrap_or_else(|e| panic!("ssh_run({command}) failed: {e}"))
@@ -196,6 +128,14 @@ async fn e2e() {
     let r = run(&mcp, &id, "false").await;
     assert_eq!(r.exit_code, Some(1), "scenario 4: exit code propagates");
 
+    // Scenario 4b: output is exactly the command output (no echo/scaffold).
+    let r = run(&mcp, &id, "printf 'SPM_EXACT'").await;
+    assert_eq!(
+        r.output, "SPM_EXACT",
+        "4b: byte-exact clean output, got {:?}",
+        r.output
+    );
+
     // Scenario 5: interactive prompt loop (type -> expect -> type -> expect).
     mcp.ssh_type(Parameters(SshTypeParams {
         session_id: id.clone(),
@@ -208,6 +148,7 @@ async fn e2e() {
             session_id: id.clone(),
             pattern: "Name\\?".into(),
             mode: "stream".into(),
+            from_offset: None,
             timeout_ms: 10000,
             max_bytes: 65536,
         }))
@@ -226,6 +167,7 @@ async fn e2e() {
             session_id: id.clone(),
             pattern: "got bob".into(),
             mode: "stream".into(),
+            from_offset: None,
             timeout_ms: 10000,
             max_bytes: 65536,
         }))
@@ -268,6 +210,7 @@ async fn e2e() {
             session_id: id.clone(),
             pattern: "\\$".into(),
             mode: "stream".into(),
+            from_offset: None,
             timeout_ms: 10000,
             max_bytes: 65536,
         }))
@@ -447,16 +390,138 @@ async fn e2e() {
         "11g: upload guard, got {err}"
     );
 
+    // Scenario 13: ssh_expect from_offset anchors the wait to the triggering
+    // action, so output that arrived BEFORE the expect call still matches.
+    let typed = mcp
+        .ssh_type(Parameters(SshTypeParams {
+            session_id: id.clone(),
+            text: "echo SPM_ANCHOR\n".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    // Wait until the output has definitively arrived (before the expect call).
+    let arrived = mcp
+        .ssh_screen(Parameters(SshScreenParams {
+            session_id: id.clone(),
+            since_seq: Some(typed.seq),
+            wait: "change".into(),
+            settle_ms: 250,
+            timeout_ms: 5000,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(!arrived.timed_out, "13: output arrived");
+    let e = mcp
+        .ssh_expect(Parameters(SshExpectParams {
+            session_id: id.clone(),
+            pattern: "SPM_ANCHOR".into(),
+            mode: "stream".into(),
+            from_offset: Some(typed.stream_offset),
+            timeout_ms: 5000,
+            max_bytes: 65536,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(e.matched, "13: from_offset catches pre-arrived output");
+
+    // Scenario 14: append creates a missing file; missing parent dir is named.
+    mcp.file_write(Parameters(FileWriteParams {
+        session_id: id.clone(),
+        path: "/tmp/append_new.txt".into(),
+        content: "created-by-append".into(),
+        mode: "append".into(),
+    }))
+    .await
+    .expect("14: append creates missing file");
+    let r = mcp
+        .file_read(Parameters(FileReadParams {
+            session_id: id.clone(),
+            path: "/tmp/append_new.txt".into(),
+            offset: 0,
+            limit: 262144,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(r.content, "created-by-append", "14: append content");
+    let err = mcp
+        .file_write(Parameters(FileWriteParams {
+            session_id: id.clone(),
+            path: "/tmp/no_such_dir_xyz/f.txt".into(),
+            content: "x".into(),
+            mode: "overwrite".into(),
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("parent directory does not exist"),
+        "14: parent dir named, got {err}"
+    );
+
+    // Scenario 15: ssh_press("up") recalls the previous command in readline.
+    run(&mcp, &id, "echo SPM_HISTORY_MARK").await;
+    let pressed = mcp
+        .ssh_press(Parameters(SshPressParams {
+            session_id: id.clone(),
+            key: "up".into(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    let s = mcp
+        .ssh_screen(Parameters(SshScreenParams {
+            session_id: id.clone(),
+            since_seq: Some(pressed.seq),
+            wait: "quiet".into(),
+            settle_ms: 500,
+            timeout_ms: 5000,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(
+        s.screen.contains("echo SPM_HISTORY_MARK"),
+        "15: up recalls last command, got:\n{}",
+        s.screen
+    );
+    mcp.ssh_press(Parameters(SshPressParams {
+        session_id: id.clone(),
+        key: "ctrl+c".into(),
+    }))
+    .await
+    .unwrap(); // discard the recalled line
+
     // Scenario 12: heredoc and multi-line commands survive ssh_run (newline-joined sentinel).
     let r = run(&mcp, &id, "cat << EOF\nhello spm\nEOF").await;
     assert_eq!(r.exit_code, Some(0), "12: heredoc exit code, got {:?}", r);
-    assert!(r.output.contains("hello spm"), "12: heredoc output, got {:?}", r.output);
+    assert!(
+        r.output.contains("hello spm"),
+        "12: heredoc output, got {:?}",
+        r.output
+    );
     let r = run(&mcp, &id, "cd /tmp\npwd").await;
-    assert!(r.output.contains("/tmp"), "12: multi-line output, got {:?}", r.output);
+    assert!(
+        r.output.contains("/tmp"),
+        "12: multi-line output, got {:?}",
+        r.output
+    );
     let r = run(&mcp, &id, "pwd").await;
-    assert!(r.output.contains("/tmp"), "12: cwd still persists after multi-line, got {:?}", r.output);
+    assert!(
+        r.output.contains("/tmp"),
+        "12: cwd still persists after multi-line, got {:?}",
+        r.output
+    );
     let r = run(&mcp, &id, "cd /\nfalse").await;
-    assert_eq!(r.exit_code, Some(1), "12: exit code of last line, got {:?}", r);
+    assert_eq!(
+        r.exit_code,
+        Some(1),
+        "12: exit code of last line, got {:?}",
+        r
+    );
 
     // Scenario 10: audit log — records commands, never the password.
     mcp.ssh_close(Parameters(sid(&id))).await.unwrap();
@@ -486,6 +551,7 @@ async fn run_result(mcp: &SshMcp, id: &str, command: &str) -> Result<SshRunOut, 
         command: command.into(),
         timeout_ms: 30000,
         max_output_bytes: 65536,
+        strip_ansi: true,
     }))
     .await
     .map(|j| j.0)

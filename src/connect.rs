@@ -331,6 +331,7 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
         reads: parking_lot::Mutex::new(Default::default()),
         write_locks: parking_lot::Mutex::new(Default::default()),
         alive,
+        bracketed_paste: false,
         pump,
     };
 
@@ -345,10 +346,25 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
     if session::wait_stream_contains(&shared, start, b"__SPM_PROBE_ok__", Duration::from_secs(3))
         .await
     {
-        // Kill PTY echo so ssh_run captures contain no echoed command.
-        let w = session.writer.lock().await;
-        let _ = w.data_bytes(&b"stty -echo\n"[..]).await;
+        // Echo stays ON between commands: readline needs the tty ECHO flag to
+        // display input and history recall (persistent stty -echo breaks
+        // up-arrow and interactive editing). ssh_run toggles echo off around
+        // each command instead (PRE handshake in tools.rs).
         session.shell_kind = ShellKind::Posix;
+        // bash/zsh readline advertise bracketed paste via \x1b[?2004h in the
+        // prompt redraw — enables paste-wrapped command delivery in ssh_run.
+        let (bytes, _, _) = shared.inner.lock().stream.read(start);
+        session.bracketed_paste = bytes.windows(7).any(|w| w == b"[?2004h");
+        // Keep our internal scaffolding (stty/marker lines, all leading-space
+        // prefixed) out of shell history so up-arrow recalls only real
+        // commands. Leading space on this very line is pointless (not yet
+        // active) but harmless.
+        let w = session.writer.lock().await;
+        let _ = w
+            .data_bytes(
+                &b" export HISTCONTROL=\"${HISTCONTROL:+$HISTCONTROL:}ignorespace\"; setopt HIST_IGNORE_SPACE 2>/dev/null\n"[..],
+            )
+            .await;
     }
 
     Ok(Opened {
