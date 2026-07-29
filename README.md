@@ -1,5 +1,8 @@
 # ssh-pty-mcp
 
+[![CI](https://github.com/paipaipai666/ssh-pty-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/paipaipai666/ssh-pty-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 MCP server that gives AI agents **fluent SSH**: persistent PTY shell sessions
 (`cd` / `export` / aliases survive across calls), a virtual keyboard for TUI
 programs (top/htop/less/menus), a server-side rendered terminal screen model
@@ -9,7 +12,10 @@ operations guarded by a read-before-write rule.
 ## Install
 
 ```sh
+# from source
 cargo install --path .
+# or once published
+cargo install ssh-pty-mcp
 ```
 
 ## MCP client config

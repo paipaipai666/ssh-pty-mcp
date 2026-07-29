@@ -2,8 +2,12 @@
 name = "ssh-pty-mcp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "MCP server giving AI agents fluent SSH: persistent PTY sessions, virtual keyboard, screen model, SFTP"
+authors = ["pai <2921839932@qq.com>"]
+repository = "https://github.com/paipaipai666/ssh-pty-mcp"
+homepage = "https://github.com/paipaipai666/ssh-pty-mcp"
 keywords = ["mcp", "ssh", "pty", "agent", "sftp"]
 categories = ["network-programming", "command-line-utilities"]
 
