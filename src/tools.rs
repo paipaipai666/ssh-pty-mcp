@@ -148,7 +148,7 @@ pub struct ListOut {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SshRunParams {
+pub struct SshShellParams {
     pub session_id: String,
     /// Shell command. Runs in the persistent shell: cwd/env survive.
     pub command: String,
@@ -164,7 +164,7 @@ pub struct SshRunParams {
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct SshRunOut {
+pub struct SshShellOut {
     pub output: String,
     pub exit_code: Option<i64>,
     pub timed_out: bool,
@@ -216,7 +216,7 @@ pub struct SshExpectParams {
     #[serde(default = "default_stream")]
     pub mode: String,
     /// Stream offset to start matching from — use the stream_offset returned
-    /// by ssh_type/ssh_press/ssh_run to avoid missing output that arrived
+    /// by ssh_type/ssh_press/ssh_shell to avoid missing output that arrived
     /// between the triggering action and this call. Default: current end.
     #[serde(default)]
     pub from_offset: Option<u64>,
@@ -237,7 +237,7 @@ pub struct SshExpectOut {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SshScreenParams {
     pub session_id: String,
-    /// Logical-clock anchor returned by ssh_type/ssh_press/ssh_run.
+    /// Logical-clock anchor returned by ssh_type/ssh_press/ssh_shell.
     #[serde(default)]
     pub since_seq: Option<u64>,
     /// "none": immediate. "change": wait for any new output. "quiet": wait for
@@ -302,6 +302,14 @@ pub struct TransferParams {
     pub remote_path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshCopyParams {
+    pub from_session: String,
+    pub from_path: String,
+    pub to_session: String,
+    pub to_path: String,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct TransferOut {
     pub bytes: u64,
@@ -343,7 +351,7 @@ pub struct SshReadyOut {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SshRunAsyncParams {
+pub struct SshShellAsyncParams {
     pub session_id: String,
     pub command: String,
     #[serde(default = "default_async_timeout")]
@@ -355,7 +363,7 @@ pub struct SshRunAsyncParams {
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-pub struct SshRunAsyncOut {
+pub struct SshShellAsyncOut {
     pub task_id: String,
 }
 
@@ -365,6 +373,16 @@ pub struct SshTaskStatusParams {
     /// Block up to this long waiting for completion. Default 0 (instant).
     #[serde(default)]
     pub wait_ms: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshTaskCancelParams {
+    pub task_id: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SshTaskCancelOut {
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -412,8 +430,11 @@ pub struct SshMcp {
 }
 
 enum TaskState {
-    Running,
-    Done(Result<SshRunOut, String>),
+    Running {
+        abort: tokio::task::AbortHandle,
+        session_id: String,
+    },
+    Done(Result<SshShellOut, String>),
 }
 
 impl SshMcp {
@@ -532,12 +553,13 @@ fn guard_check(session: &Session, real: &str, fp: Fingerprint, tool: &str) -> Re
 #[tool_router(server_handler)]
 impl SshMcp {
     #[tool(
-        description = "Open a persistent SSH shell session (PTY). Auth order: explicit private_key, then SSH agent, then password. Returns session_id used by all other tools. The shell persists: cwd, env, and aliases survive across ssh_run calls."
+        description = "Open a persistent SSH shell session (PTY). Auth order: explicit private_key, then SSH agent, then password. Returns session_id used by all other tools. The shell persists: cwd, env, and aliases survive across ssh_shell calls."
     )]
     pub async fn ssh_open(
         &self,
         Parameters(p): Parameters<SshOpenParams>,
     ) -> Result<Json<SshOpenOut>, McpError> {
+        self.sessions.prune_dead().await;
         if self.sessions.list().await.len() >= self.max_sessions {
             return Err(invalid(format!(
                 "session limit reached ({}); close unused sessions with ssh_close first",
@@ -628,6 +650,7 @@ impl SshMcp {
 
     #[tool(description = "List all open sessions with their targets, shell kind, and liveness.")]
     pub async fn ssh_list(&self) -> Result<Json<ListOut>, McpError> {
+        self.sessions.prune_dead().await;
         let sessions = self
             .sessions
             .list()
@@ -648,10 +671,10 @@ impl SshMcp {
     #[tool(
         description = "Run a command in the persistent shell and return clean output + exit code. Persistent shell: cwd/env/aliases survive across calls. For system monitoring prefer batch commands (top -b -n 1, ps aux --sort=-%cpu | head) over interactive TUIs. PRECONDITION: the shell must be at a prompt — if you used ssh_type/ssh_press to start a long-running or interactive command (vi, passwd, ssh...), first confirm it finished via ssh_expect/ssh_screen, otherwise a scaffolding line may be typed into the foreground program. On timeout returns partial output with timed_out=true (the command keeps running)."
     )]
-    pub async fn ssh_run(
+    pub async fn ssh_shell(
         &self,
-        Parameters(p): Parameters<SshRunParams>,
-    ) -> Result<Json<SshRunOut>, McpError> {
+        Parameters(p): Parameters<SshShellParams>,
+    ) -> Result<Json<SshShellOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
         Self::run_core(
             &session,
@@ -665,7 +688,7 @@ impl SshMcp {
         .map(Json)
     }
 
-    /// Shared ssh_run implementation, also driven by ssh_run_async tasks.
+    /// Shared ssh_shell implementation, also driven by ssh_shell_async tasks.
     async fn run_core(
         session: &Arc<Session>,
         audit: &AuditLog,
@@ -673,10 +696,10 @@ impl SshMcp {
         timeout_ms: u64,
         max_output_bytes: u64,
         strip_ansi: bool,
-    ) -> Result<SshRunOut, McpError> {
+    ) -> Result<SshShellOut, McpError> {
         if session.shell_kind != ShellKind::Posix {
             return Err(invalid(
-                "ssh_run requires a POSIX-like shell (probe failed at open); use ssh_type + ssh_expect instead",
+                "ssh_shell requires a POSIX-like shell (probe failed at open); use ssh_type + ssh_expect instead",
             ));
         }
         let _io = session.io_lock.lock().await;
@@ -816,10 +839,10 @@ impl SshMcp {
         let output = tail_chars(&output, max_output_bytes as usize);
         audit.log(
             &session.id,
-            "ssh_run",
+            "ssh_shell",
             serde_json::json!({"command": command, "exit_code": exit_code, "timed_out": timed_out}),
         );
-        Ok(SshRunOut {
+        Ok(SshShellOut {
             output,
             exit_code,
             timed_out,
@@ -829,7 +852,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Type text verbatim into the terminal (no implicit newline — include \\n to submit). Returns the seq anchor for ssh_screen(since_seq). Content is redacted in the audit log. If the text starts a long-running or interactive command, confirm it finished (ssh_expect/ssh_screen) before calling ssh_run."
+        description = "Type text verbatim into the terminal (no implicit newline — include \\n to submit). Returns the seq anchor for ssh_screen(since_seq). Content is redacted in the audit log. If the text starts a long-running or interactive command, confirm it finished (ssh_expect/ssh_screen) before calling ssh_shell."
     )]
     pub async fn ssh_type(
         &self,
@@ -878,7 +901,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Send a signal (sigint/sigquit/sigterm/sigkill/sighup/sigtstp) via the SSH protocol to the shell's foreground process group. Note: some servers/sudo contexts ignore SSH signal requests — fallback is ssh_press(\"ctrl+c\") or ssh_run(\"kill -<SIG> <pid>\")."
+        description = "Send a signal (sigint/sigquit/sigterm/sigkill/sighup/sigtstp) via the SSH protocol to the shell's foreground process group. Note: some servers/sudo contexts ignore SSH signal requests — fallback is ssh_press(\"ctrl+c\") or ssh_shell(\"kill -<SIG> <pid>\")."
     )]
     pub async fn ssh_signal(
         &self,
@@ -1232,7 +1255,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Execute a command via a one-shot SSH exec channel: stateless (no cwd/env carryover), protocol-level exit status, separate stdout/stderr, and completely isolated from the persistent shell (safe even while it runs an interactive program). Prefer this for simple read-only probes; use ssh_run when you need shell state or features."
+        description = "Execute a command via a one-shot SSH exec channel: stateless (no cwd/env carryover), protocol-level exit status, separate stdout/stderr, and completely isolated from the persistent shell (safe even while it runs an interactive program). Prefer this for simple read-only probes; use ssh_shell when you need shell state or features."
     )]
     pub async fn ssh_exec(
         &self,
@@ -1337,23 +1360,20 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Start a command in the persistent shell without blocking; returns task_id. Poll with ssh_task_status (optionally with wait_ms). Same semantics as ssh_run (state persists, at-prompt precondition); the task holds the shell until done, so avoid other ssh_run calls in the meantime (ssh_exec, ssh_screen, ssh_expect, file tools remain usable)."
+        description = "Start a command in the persistent shell without blocking; returns task_id. Poll with ssh_task_status (optionally with wait_ms). Same semantics as ssh_shell (state persists, at-prompt precondition); the task holds the shell until done, so avoid other ssh_shell calls in the meantime (ssh_exec, ssh_screen, ssh_expect, file tools remain usable)."
     )]
-    pub async fn ssh_run_async(
+    pub async fn ssh_shell_async(
         &self,
-        Parameters(p): Parameters<SshRunAsyncParams>,
-    ) -> Result<Json<SshRunAsyncOut>, McpError> {
+        Parameters(p): Parameters<SshShellAsyncParams>,
+    ) -> Result<Json<SshShellAsyncOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
         let task_id = format!("t{}", self.next_task.fetch_add(1, Ordering::SeqCst) + 1);
-        self.tasks
-            .lock()
-            .await
-            .insert(task_id.clone(), TaskState::Running);
         let tasks = self.tasks.clone();
         let audit = self.audit.clone();
         let tid = task_id.clone();
         let command = p.command.clone();
-        tokio::spawn(async move {
+        let sid = session.id.clone();
+        let join = tokio::spawn(async move {
             let result = Self::run_core(
                 &session,
                 &audit,
@@ -1366,11 +1386,18 @@ impl SshMcp {
             .map_err(|e| e.to_string());
             tasks.lock().await.insert(tid, TaskState::Done(result));
         });
-        Ok(Json(SshRunAsyncOut { task_id }))
+        self.tasks.lock().await.insert(
+            task_id.clone(),
+            TaskState::Running {
+                abort: join.abort_handle(),
+                session_id: sid,
+            },
+        );
+        Ok(Json(SshShellAsyncOut { task_id }))
     }
 
     #[tool(
-        description = "Check a background task started by ssh_run_async. With wait_ms > 0, blocks until the task completes or the wait elapses. Returns status running/done/error plus output and exit_code when finished."
+        description = "Check a background task started by ssh_shell_async. With wait_ms > 0, blocks until the task completes or the wait elapses. Returns status running/done/error plus output and exit_code when finished."
     )]
     pub async fn ssh_task_status(
         &self,
@@ -1383,7 +1410,7 @@ impl SshMcp {
                 match tasks.get(&p.task_id) {
                     None => {
                         return Err(invalid(format!(
-                            "unknown task '{}' (from ssh_run_async)",
+                            "unknown task '{}' (from ssh_shell_async)",
                             p.task_id
                         )));
                     }
@@ -1405,7 +1432,7 @@ impl SshMcp {
                             error: Some(e.clone()),
                         }));
                     }
-                    Some(TaskState::Running) => {}
+                    Some(TaskState::Running { .. }) => {}
                 }
             }
             if deadline.saturating_duration_since(Instant::now()).is_zero() {
@@ -1419,6 +1446,133 @@ impl SshMcp {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    #[tool(
+        description = "Cancel a running ssh_shell_async task: sends SIGINT (ctrl+c) to the remote foreground command and stops the local wait. The session stays alive and usable. A command ignoring SIGINT keeps running remotely — follow up with ssh_shell('kill -<SIG> <pid>') if needed."
+    )]
+    pub async fn ssh_task_cancel(
+        &self,
+        Parameters(p): Parameters<SshTaskCancelParams>,
+    ) -> Result<Json<SshTaskCancelOut>, McpError> {
+        let (abort, session_id) = {
+            let tasks = self.tasks.lock().await;
+            match tasks.get(&p.task_id) {
+                None => return Err(invalid(format!("unknown task '{}'", p.task_id))),
+                Some(TaskState::Running { abort, session_id }) => {
+                    (abort.clone(), session_id.clone())
+                }
+                Some(TaskState::Done(_)) => {
+                    return Ok(Json(SshTaskCancelOut { cancelled: false }));
+                }
+            }
+        };
+        // Interrupt the remote foreground command. The queued scaffold lines
+        // then run, so the shell returns to a clean prompt state.
+        abort.abort();
+        if let Some(session) = self.find_session(&session_id).await {
+            let w = session.writer.lock().await;
+            let _ = w.data_bytes(&b"\x03"[..]).await;
+        }
+        self.tasks
+            .lock()
+            .await
+            .insert(p.task_id.clone(), TaskState::Done(Err("cancelled".into())));
+        self.audit.log(
+            &session_id,
+            "ssh_task_cancel",
+            serde_json::json!({"task_id": p.task_id}),
+        );
+        Ok(Json(SshTaskCancelOut { cancelled: true }))
+    }
+
+    #[tool(
+        description = "Copy a file directly between two SSH sessions (possibly different hosts), streamed through this server — no local disk staging. Overwriting an existing destination requires a prior full file_read of it on the destination session (read-before-write guard). Same-host copies are simpler via ssh_shell('cp -r a b')."
+    )]
+    pub async fn ssh_copy(
+        &self,
+        Parameters(p): Parameters<SshCopyParams>,
+    ) -> Result<Json<TransferOut>, McpError> {
+        let from = self.live_session(&p.from_session).await?;
+        let to = self.live_session(&p.to_session).await?;
+
+        // Same session: one SFTP lock, one code path.
+        if from.id == to.id {
+            let mut g = Self::sftp(&from).await?;
+            let s = g.as_mut().unwrap();
+            let real_from = s
+                .canonicalize(&p.from_path)
+                .await
+                .unwrap_or_else(|_| p.from_path.clone());
+            let real_to = s
+                .canonicalize(&p.to_path)
+                .await
+                .unwrap_or_else(|_| p.to_path.clone());
+            let path_lock = to.write_lock_for(&real_to);
+            let _wg = path_lock.lock().await;
+            if let Ok(meta) = s.metadata(&real_to).await {
+                let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
+                if fp.0 > 0 {
+                    guard_check(&to, &real_to, fp, "ssh_copy")?;
+                }
+            }
+            let mut src = s.open(&real_from).await.map_err(internal)?;
+            let mut dst = s
+                .create(&real_to)
+                .await
+                .map_err(|e| create_error(e, &real_to))?;
+            let bytes = tokio::io::copy(&mut src, &mut dst)
+                .await
+                .map_err(internal)?;
+            self.audit.log(
+                &from.id,
+                "ssh_copy",
+                serde_json::json!({"from": real_from, "to": real_to, "bytes": bytes}),
+            );
+            return Ok(Json(TransferOut { bytes }));
+        }
+
+        // Different sessions: take both SFTP locks in session-id order.
+        let (first, second) = if from.id < to.id {
+            (&from, &to)
+        } else {
+            (&to, &from)
+        };
+        let mut g1 = Self::sftp(first).await?;
+        let mut g2 = Self::sftp(second).await?;
+        let s1 = g1.as_mut().unwrap();
+        let s2 = g2.as_mut().unwrap();
+        let (sftp_from, sftp_to) = if from.id < to.id { (s1, s2) } else { (s2, s1) };
+        let real_from = sftp_from
+            .canonicalize(&p.from_path)
+            .await
+            .unwrap_or_else(|_| p.from_path.clone());
+        let real_to = sftp_to
+            .canonicalize(&p.to_path)
+            .await
+            .unwrap_or_else(|_| p.to_path.clone());
+        let path_lock = to.write_lock_for(&real_to);
+        let _wg = path_lock.lock().await;
+        if let Ok(meta) = sftp_to.metadata(&real_to).await {
+            let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
+            if fp.0 > 0 {
+                guard_check(&to, &real_to, fp, "ssh_copy")?;
+            }
+        }
+        let mut src = sftp_from.open(&real_from).await.map_err(internal)?;
+        let mut dst = sftp_to
+            .create(&real_to)
+            .await
+            .map_err(|e| create_error(e, &real_to))?;
+        let bytes = tokio::io::copy(&mut src, &mut dst)
+            .await
+            .map_err(internal)?;
+        self.audit.log(
+            &from.id,
+            "ssh_copy",
+            serde_json::json!({"from": real_from, "to_session": to.id, "to": real_to, "bytes": bytes}),
+        );
+        Ok(Json(TransferOut { bytes }))
     }
 
     #[tool(
@@ -1447,7 +1601,7 @@ impl SshMcp {
         let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
         if fp.0 > 16 * 1024 * 1024 {
             return Err(invalid(format!(
-                "{real} is too large for file_edit (16 MiB cap); use ssh_run with sed instead"
+                "{real} is too large for file_edit (16 MiB cap); use ssh_shell with sed instead"
             )));
         }
         let data = sftp.read(&real).await.map_err(internal)?;

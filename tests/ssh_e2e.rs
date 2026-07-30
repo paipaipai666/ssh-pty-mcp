@@ -53,8 +53,8 @@ async fn open_tool(mcp: &SshMcp, port: u16) -> String {
     out.0.session_id
 }
 
-async fn run(mcp: &SshMcp, id: &str, command: &str) -> SshRunOut {
-    mcp.ssh_run(Parameters(SshRunParams {
+async fn run(mcp: &SshMcp, id: &str, command: &str) -> SshShellOut {
+    mcp.ssh_shell(Parameters(SshShellParams {
         session_id: id.into(),
         command: command.into(),
         timeout_ms: 30000,
@@ -62,7 +62,7 @@ async fn run(mcp: &SshMcp, id: &str, command: &str) -> SshRunOut {
         strip_ansi: true,
     }))
     .await
-    .unwrap_or_else(|e| panic!("ssh_run({command}) failed: {e}"))
+    .unwrap_or_else(|e| panic!("ssh_shell({command}) failed: {e}"))
     .0
 }
 
@@ -500,7 +500,7 @@ async fn e2e() {
     .await
     .unwrap(); // discard the recalled line
 
-    // Scenario 12: heredoc and multi-line commands survive ssh_run (newline-joined sentinel).
+    // Scenario 12: heredoc and multi-line commands survive ssh_shell (newline-joined sentinel).
     let r = run(&mcp, &id, "cat << EOF\nhello spm\nEOF").await;
     assert_eq!(r.exit_code, Some(0), "12: heredoc exit code, got {:?}", r);
     assert!(
@@ -660,7 +660,7 @@ async fn e2e() {
 
     // Scenario 21: async task.
     let a = mcp
-        .ssh_run_async(Parameters(SshRunAsyncParams {
+        .ssh_shell_async(Parameters(SshShellAsyncParams {
             session_id: id.clone(),
             command: "sleep 2 && echo ASYNC_DONE".into(),
             timeout_ms: 30000,
@@ -803,6 +803,140 @@ async fn e2e() {
         .0;
     assert_eq!(e.replacements, 2);
 
+    // Scenario 23: dead sessions are pruned (alias + limit slot released).
+    let mut mortal = ssh_open_params(port);
+    mortal.name = Some("mortal".into());
+    let m = mcp
+        .ssh_open(Parameters(mortal.clone()))
+        .await
+        .expect("23: open mortal");
+    let mid = m.0.session_id;
+    // Kill the shell; ssh_shell will time out, but the pump marks the session dead.
+    let _ = mcp
+        .ssh_shell(Parameters(SshShellParams {
+            session_id: mid.clone(),
+            command: "exit 99".into(),
+            timeout_ms: 3000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let list = mcp.ssh_list().await.unwrap().0;
+    assert!(
+        !list.sessions.iter().any(|s| s.session_id == mid),
+        "23: dead session pruned from list"
+    );
+    mcp.ssh_open(Parameters(mortal))
+        .await
+        .expect("23: alias reusable after death");
+
+    // Scenario 24: ssh_task_cancel interrupts without killing the session.
+    let a = mcp
+        .ssh_shell_async(Parameters(SshShellAsyncParams {
+            session_id: id.clone(),
+            command: "sleep 30 && echo NEVER".into(),
+            timeout_ms: 60000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let c = mcp
+        .ssh_task_cancel(Parameters(SshTaskCancelParams {
+            task_id: a.task_id.clone(),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(c.cancelled, "24: cancel accepted");
+    let st = mcp
+        .ssh_task_status(Parameters(SshTaskStatusParams {
+            task_id: a.task_id.clone(),
+            wait_ms: 0,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(st.status, "error", "24: task marked cancelled, got {st:?}");
+    let r = run(&mcp, &id, "echo ALIVE").await;
+    assert!(
+        r.output.contains("ALIVE"),
+        "24: session survives cancel, got {:?}",
+        r.output
+    );
+
+    // Scenario 25: ssh_copy — same-session and cross-session paths.
+    mcp.file_write(Parameters(FileWriteParams {
+        session_id: id.clone(),
+        path: "/tmp/copy_src.txt".into(),
+        content: "copy-payload".into(),
+        mode: "overwrite".into(),
+    }))
+    .await
+    .expect("25: seed");
+    mcp.ssh_copy(Parameters(SshCopyParams {
+        from_session: id.clone(),
+        from_path: "/tmp/copy_src.txt".into(),
+        to_session: id.clone(),
+        to_path: "/tmp/copy_dst.txt".into(),
+    }))
+    .await
+    .expect("25: same-session copy");
+    let r = mcp
+        .file_read(Parameters(FileReadParams {
+            session_id: id.clone(),
+            path: "/tmp/copy_dst.txt".into(),
+            offset: 0,
+            limit: 262144,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(r.content, "copy-payload", "25: same-session content");
+    let s2 = open_tool(&mcp, port).await;
+    mcp.ssh_copy(Parameters(SshCopyParams {
+        from_session: id.clone(),
+        from_path: "/tmp/copy_src.txt".into(),
+        to_session: s2.clone(),
+        to_path: "/tmp/copy_x.txt".into(),
+    }))
+    .await
+    .expect("25: cross-session copy");
+    let r = mcp
+        .file_read(Parameters(FileReadParams {
+            session_id: s2.clone(),
+            path: "/tmp/copy_x.txt".into(),
+            offset: 0,
+            limit: 262144,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(r.content, "copy-payload", "25: cross-session content");
+    mcp.ssh_close(Parameters(sid(&s2))).await.unwrap();
+
+    // Scenario 26: ssh_exec handles heredoc natively (no readline involved).
+    let x = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: id.clone(),
+            command: "cat << EOF\nhi spm\nEOF".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(
+        x.stdout.contains("hi spm"),
+        "26: exec heredoc, got {:?}",
+        x.stdout
+    );
+    assert_eq!(x.exit_code, Some(0));
+
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(
         SessionManager::default(),
@@ -836,7 +970,10 @@ async fn e2e() {
     // Scenario 10: audit log — records commands, never the password.
     mcp.ssh_close(Parameters(sid(&id))).await.unwrap();
     let log = std::fs::read_to_string(&audit_path).unwrap();
-    assert!(log.contains("\"tool\":\"ssh_run\""), "10: ssh_run logged");
+    assert!(
+        log.contains("\"tool\":\"ssh_shell\""),
+        "10: ssh_shell logged"
+    );
     assert!(log.contains("cd /etc && pwd"), "10: command text logged");
     assert!(!log.contains("testpass"), "10: password never logged");
 
@@ -855,8 +992,8 @@ async fn e2e() {
     }
 }
 
-async fn run_result(mcp: &SshMcp, id: &str, command: &str) -> Result<SshRunOut, rmcp::ErrorData> {
-    mcp.ssh_run(Parameters(SshRunParams {
+async fn run_result(mcp: &SshMcp, id: &str, command: &str) -> Result<SshShellOut, rmcp::ErrorData> {
+    mcp.ssh_shell(Parameters(SshShellParams {
         session_id: id.into(),
         command: command.into(),
         timeout_ms: 30000,

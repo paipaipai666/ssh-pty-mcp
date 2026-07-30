@@ -146,6 +146,15 @@ impl SessionManager {
     pub async fn list(&self) -> Vec<Arc<Session>> {
         self.sessions.lock().await.values().cloned().collect()
     }
+
+    /// Drop sessions whose shell died (EOF/Close or killed). Their names and
+    /// limit slots are released for reuse.
+    pub async fn prune_dead(&self) {
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, s| s.alive.load(Ordering::SeqCst));
+    }
 }
 
 /// Spawn the pump: remote bytes -> screen model + stream buffer.
