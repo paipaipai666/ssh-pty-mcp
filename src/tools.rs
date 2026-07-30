@@ -297,13 +297,15 @@ pub struct TransferOut {
 pub struct SshMcp {
     sessions: Arc<SessionManager>,
     audit: Arc<AuditLog>,
+    max_sessions: usize,
 }
 
 impl SshMcp {
-    pub fn new(sessions: SessionManager, audit: Arc<AuditLog>) -> Self {
+    pub fn new(sessions: SessionManager, audit: Arc<AuditLog>, max_sessions: usize) -> Self {
         Self {
             sessions: Arc::new(sessions),
             audit,
+            max_sessions,
         }
     }
 
@@ -406,6 +408,12 @@ impl SshMcp {
         &self,
         Parameters(p): Parameters<SshOpenParams>,
     ) -> Result<Json<SshOpenOut>, McpError> {
+        if self.sessions.list().await.len() >= self.max_sessions {
+            return Err(invalid(format!(
+                "session limit reached ({}); close unused sessions with ssh_close first",
+                self.max_sessions
+            )));
+        }
         let policy = match p.host_key_policy.as_str() {
             "accept-new" => HostKeyPolicy::AcceptNew,
             "off" => HostKeyPolicy::Off,
@@ -491,7 +499,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Run a command in the persistent shell and return clean output + exit code. Persistent shell: cwd/env/aliases survive across calls. For system monitoring prefer batch commands (top -b -n 1, ps aux --sort=-%cpu | head) over interactive TUIs. On timeout returns partial output with timed_out=true (the command keeps running — use ssh_type/ssh_press to interact)."
+        description = "Run a command in the persistent shell and return clean output + exit code. Persistent shell: cwd/env/aliases survive across calls. For system monitoring prefer batch commands (top -b -n 1, ps aux --sort=-%cpu | head) over interactive TUIs. PRECONDITION: the shell must be at a prompt — if you used ssh_type/ssh_press to start a long-running or interactive command (vi, passwd, ssh...), first confirm it finished via ssh_expect/ssh_screen, otherwise a scaffolding line may be typed into the foreground program. On timeout returns partial output with timed_out=true (the command keeps running)."
     )]
     pub async fn ssh_run(
         &self,
@@ -551,7 +559,7 @@ impl SshMcp {
         .await;
         if !pre_ok {
             return Err(internal(
-                "shell did not acknowledge echo toggle (busy or non-POSIX); retry or use ssh_type/ssh_expect",
+                "shell did not acknowledge echo toggle: it is busy or an interactive program (vi/passwd/ssh) is running — the scaffolding line may have been consumed by it; inspect with ssh_screen before retrying",
             ));
         }
         // Let the post-PRE prompt redraw finish so it cannot leak into the
@@ -653,7 +661,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Type text verbatim into the terminal (no implicit newline — include \\n to submit). Returns the seq anchor for ssh_screen(since_seq). Content is redacted in the audit log."
+        description = "Type text verbatim into the terminal (no implicit newline — include \\n to submit). Returns the seq anchor for ssh_screen(since_seq). Content is redacted in the audit log. If the text starts a long-running or interactive command, confirm it finished (ssh_expect/ssh_screen) before calling ssh_run."
     )]
     pub async fn ssh_type(
         &self,
@@ -920,7 +928,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Write a remote text file via SFTP. Prefer this over opening vim/nano in the terminal. mode=overwrite requires having read the full current file via file_read first — the server enforces this; partial reads are rejected with the missing byte ranges. overwrite on a NOT-YET-EXISTING file is allowed without any read. mode=append is always allowed and creates the file if missing. Parent directory must exist."
+        description = "Write a remote text file via SFTP (UTF-8 text only — for binary content, stage it locally and use ssh_upload). Prefer this over opening vim/nano in the terminal. mode=overwrite requires having read the full current file via file_read first — the server enforces this; partial reads are rejected with the missing byte ranges. overwrite on a NOT-YET-EXISTING file is allowed without any read. mode=append is always allowed and creates the file if missing. Parent directory must exist."
     )]
     pub async fn file_write(
         &self,

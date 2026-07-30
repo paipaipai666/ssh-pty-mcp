@@ -21,6 +21,9 @@ struct Cli {
     /// Audit log path (JSONL). Default: ~/.ssh-pty-mcp/audit.jsonl
     #[arg(long)]
     audit_log: Option<PathBuf>,
+    /// Maximum concurrent SSH sessions.
+    #[arg(long, default_value = "16")]
+    max_sessions: usize,
 }
 
 #[tokio::main]
@@ -35,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::new(
         cli.audit_log.unwrap_or_else(AuditLog::default_path),
     ));
-    let server = SshMcp::new(SessionManager::default(), audit);
+    let server = SshMcp::new(SessionManager::default(), audit, cli.max_sessions);
     let service = server
         .serve(stdio())
         .await

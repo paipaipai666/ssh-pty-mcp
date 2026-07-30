@@ -102,6 +102,7 @@ async fn e2e() {
     let mcp = SshMcp::new(
         SessionManager::default(),
         Arc::new(AuditLog::new(audit_path.clone())),
+        16,
     );
     let id = open_tool(&mcp, port).await;
 
@@ -522,6 +523,36 @@ async fn e2e() {
         "12: exit code of last line, got {:?}",
         r
     );
+
+    // Scenario 16: session limit is enforced.
+    let limited = SshMcp::new(
+        SessionManager::default(),
+        Arc::new(AuditLog::new(audit_dir.path().join("audit2.jsonl"))),
+        1,
+    );
+    let first = limited
+        .ssh_open(Parameters(ssh_open_params(port)))
+        .await
+        .expect("16: first session under limit");
+    let err = limited
+        .ssh_open(Parameters(ssh_open_params(port)))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("session limit reached"),
+        "16: limit error, got {err}"
+    );
+    limited
+        .ssh_close(Parameters(SessionParams {
+            session_id: first.0.session_id,
+        }))
+        .await
+        .unwrap();
+    limited
+        .ssh_open(Parameters(ssh_open_params(port)))
+        .await
+        .expect("16: open succeeds again after close");
 
     // Scenario 10: audit log — records commands, never the password.
     mcp.ssh_close(Parameters(sid(&id))).await.unwrap();
