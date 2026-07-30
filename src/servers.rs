@@ -122,7 +122,6 @@ fn parse_bytes(bytes: &[u8], path: &std::path::Path) -> Result<ServersFile, Stri
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))
 }
 
-
 /// Registry + ~/.ssh/config aliases, passwords redacted.
 pub fn list_summaries() -> Vec<ServerSummary> {
     let mut out: Vec<ServerSummary> = load()
@@ -198,4 +197,3 @@ mod tests {
         assert!(err.contains("failed to parse"));
     }
 }
-
