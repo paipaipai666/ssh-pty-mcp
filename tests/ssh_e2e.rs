@@ -21,6 +21,7 @@ fn params(port: u16) -> ConnectParams {
         host: "127.0.0.1".into(),
         port,
         user: "test".into(),
+        name: None,
         password: Some("testpass".into()),
         private_key: None,
         passphrase: None,
@@ -191,6 +192,7 @@ async fn e2e() {
             wait: "quiet".into(),
             settle_ms: 1000,
             timeout_ms: 8000,
+            tail_lines: None,
         }))
         .await
         .unwrap()
@@ -409,6 +411,7 @@ async fn e2e() {
             wait: "change".into(),
             settle_ms: 250,
             timeout_ms: 5000,
+            tail_lines: None,
         }))
         .await
         .unwrap()
@@ -480,6 +483,7 @@ async fn e2e() {
             wait: "quiet".into(),
             settle_ms: 500,
             timeout_ms: 5000,
+            tail_lines: None,
         }))
         .await
         .unwrap()
@@ -523,6 +527,281 @@ async fn e2e() {
         "12: exit code of last line, got {:?}",
         r
     );
+
+    // Scenario 17: ssh_exec — stateless, isolated from the persistent shell.
+    let x = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: id.clone(),
+            command: "pwd".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        x.stdout.trim(),
+        "/home/test",
+        "17: exec is stateless (shell cwd is /), got {:?}",
+        x.stdout
+    );
+    let x = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: id.clone(),
+            command: "echo OUT; echo ERR >&2; exit 3".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(x.stdout.contains("OUT"), "17: stdout, got {:?}", x.stdout);
+    assert!(
+        x.stderr.contains("ERR"),
+        "17: stderr separated, got {:?}",
+        x.stderr
+    );
+    assert_eq!(
+        x.exit_code,
+        Some(3),
+        "17: protocol exit status, full={:?}",
+        (x.exit_code, x.timed_out, x.stdout.len(), x.stderr.len())
+    );
+
+    // Scenario 18: ssh_ready — true at prompt, false while a command runs.
+    let r = mcp
+        .ssh_ready(Parameters(SshReadyParams {
+            session_id: id.clone(),
+            probe_timeout_ms: 2000,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(r.ready, "18: ready at prompt");
+    mcp.ssh_type(Parameters(SshTypeParams {
+        session_id: id.clone(),
+        text: "sleep 2\n".into(),
+    }))
+    .await
+    .unwrap();
+    let r = mcp
+        .ssh_ready(Parameters(SshReadyParams {
+            session_id: id.clone(),
+            probe_timeout_ms: 400,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(!r.ready, "18: not ready during sleep");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let r = mcp
+        .ssh_ready(Parameters(SshReadyParams {
+            session_id: id.clone(),
+            probe_timeout_ms: 2000,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(r.ready, "18: ready again after sleep");
+
+    // Scenario 19: ssh_screen tail_lines.
+    let s = mcp
+        .ssh_screen(Parameters(SshScreenParams {
+            session_id: id.clone(),
+            since_seq: None,
+            wait: "none".into(),
+            settle_ms: 250,
+            timeout_ms: 5000,
+            tail_lines: Some(1),
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(
+        s.screen.lines().count(),
+        1,
+        "19: exactly one line, got {:?}",
+        s.screen
+    );
+
+    // Scenario 20: session naming.
+    let mut named = ssh_open_params(port);
+    named.name = Some("web1".into());
+    let n1 = mcp
+        .ssh_open(Parameters(named.clone()))
+        .await
+        .expect("20: named open");
+    assert_eq!(n1.0.name.as_deref(), Some("web1"));
+    let list = mcp.ssh_list().await.unwrap().0;
+    assert!(
+        list.sessions
+            .iter()
+            .any(|s| s.name.as_deref() == Some("web1")),
+        "20: name in list"
+    );
+    let r = run(&mcp, "web1", "echo VIA_NAME").await;
+    assert!(
+        r.output.contains("VIA_NAME"),
+        "20: run by alias, got {:?}",
+        r.output
+    );
+    let err = mcp.ssh_open(Parameters(named)).await.err().unwrap();
+    assert!(
+        err.message.contains("already in use"),
+        "20: duplicate name rejected, got {err}"
+    );
+    mcp.ssh_close(Parameters(SessionParams {
+        session_id: "web1".into(),
+    }))
+    .await
+    .expect("20: close by alias");
+
+    // Scenario 21: async task.
+    let a = mcp
+        .ssh_run_async(Parameters(SshRunAsyncParams {
+            session_id: id.clone(),
+            command: "sleep 2 && echo ASYNC_DONE".into(),
+            timeout_ms: 30000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    let st = mcp
+        .ssh_task_status(Parameters(SshTaskStatusParams {
+            task_id: a.task_id.clone(),
+            wait_ms: 0,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(st.status, "running", "21: immediately running");
+    let st = mcp
+        .ssh_task_status(Parameters(SshTaskStatusParams {
+            task_id: a.task_id.clone(),
+            wait_ms: 8000,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(st.status, "done", "21: completes, got {st:?}");
+    assert!(
+        st.output.unwrap_or_default().contains("ASYNC_DONE"),
+        "21: output captured"
+    );
+    assert_eq!(st.exit_code, Some(0));
+
+    // Scenario 22: file_edit with read-before-write guard.
+    mcp.file_write(Parameters(FileWriteParams {
+        session_id: id.clone(),
+        path: "/tmp/edit.txt".into(),
+        content: "line1\nline2 TARGET\nline3\n".into(),
+        mode: "overwrite".into(),
+    }))
+    .await
+    .expect("22: seed file");
+    let denied = mcp
+        .file_edit(Parameters(FileEditParams {
+            session_id: id.clone(),
+            path: "/tmp/edit.txt".into(),
+            old_string: "TARGET".into(),
+            new_string: "HIT".into(),
+            replace_all: false,
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        denied.message.contains("prior file_read"),
+        "22: unread edit denied, got {denied}"
+    );
+    mcp.file_read(Parameters(FileReadParams {
+        session_id: id.clone(),
+        path: "/tmp/edit.txt".into(),
+        offset: 0,
+        limit: 262144,
+    }))
+    .await
+    .unwrap();
+    let e = mcp
+        .file_edit(Parameters(FileEditParams {
+            session_id: id.clone(),
+            path: "/tmp/edit.txt".into(),
+            old_string: "TARGET".into(),
+            new_string: "HIT".into(),
+            replace_all: false,
+        }))
+        .await
+        .expect("22: edit after read")
+        .0;
+    assert_eq!(e.replacements, 1);
+    assert!(
+        e.context.contains("HIT"),
+        "22: context shows replacement, got {:?}",
+        e.context
+    );
+    let err = mcp
+        .file_edit(Parameters(FileEditParams {
+            session_id: id.clone(),
+            path: "/tmp/edit.txt".into(),
+            old_string: "MISSING".into(),
+            new_string: "x".into(),
+            replace_all: false,
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("not found"),
+        "22: absent old_string, got {err}"
+    );
+    // Multi-match: append duplicates, re-read, then replace_all.
+    mcp.file_write(Parameters(FileWriteParams {
+        session_id: id.clone(),
+        path: "/tmp/edit.txt".into(),
+        content: "same\nsame\n".into(),
+        mode: "append".into(),
+    }))
+    .await
+    .unwrap();
+    let err = mcp
+        .file_edit(Parameters(FileEditParams {
+            session_id: id.clone(),
+            path: "/tmp/edit.txt".into(),
+            old_string: "same".into(),
+            new_string: "diff".into(),
+            replace_all: false,
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("matches 2 times"),
+        "22: multi-match rejected, got {err}"
+    );
+    mcp.file_read(Parameters(FileReadParams {
+        session_id: id.clone(),
+        path: "/tmp/edit.txt".into(),
+        offset: 0,
+        limit: 262144,
+    }))
+    .await
+    .unwrap();
+    let e = mcp
+        .file_edit(Parameters(FileEditParams {
+            session_id: id.clone(),
+            path: "/tmp/edit.txt".into(),
+            old_string: "same".into(),
+            new_string: "diff".into(),
+            replace_all: true,
+        }))
+        .await
+        .expect("22: replace_all after full read")
+        .0;
+    assert_eq!(e.replacements, 2);
 
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(

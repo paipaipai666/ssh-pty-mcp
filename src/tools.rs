@@ -64,10 +64,16 @@ fn default_stream() -> String {
 fn default_wait_none() -> String {
     "none".into()
 }
+fn default_ready_timeout() -> u64 {
+    2000
+}
+fn default_async_timeout() -> u64 {
+    600_000
+}
 
 // ── Params & outputs ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SshOpenParams {
     /// Hostname, IP, or a Host alias from ~/.ssh/config.
     pub host: String,
@@ -77,6 +83,10 @@ pub struct SshOpenParams {
     /// Login user. Omit to use ~/.ssh/config.
     #[serde(default)]
     pub user: Option<String>,
+    /// Optional alias for this session (must be unique). Usable anywhere
+    /// session_id is accepted.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Password auth (tried after key/agent). Never logged.
     #[serde(default)]
     pub password: Option<String>,
@@ -109,6 +119,7 @@ pub struct SshOpenOut {
     pub shell_kind: ShellKind,
     pub target: String,
     pub auth_method: String,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -124,6 +135,7 @@ pub struct ClosedOut {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ListEntry {
     pub session_id: String,
+    pub name: Option<String>,
     pub target: String,
     pub shell_kind: ShellKind,
     pub alive: bool,
@@ -236,6 +248,10 @@ pub struct SshScreenParams {
     pub settle_ms: u64,
     #[serde(default = "default_expect_timeout")]
     pub timeout_ms: u64,
+    /// Return only the last N lines of the screen (e.g. 1 = just the prompt
+    /// line). Default: full viewport.
+    #[serde(default)]
+    pub tail_lines: Option<u8>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -291,6 +307,99 @@ pub struct TransferOut {
     pub bytes: u64,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshExecParams {
+    pub session_id: String,
+    /// Command executed via a one-shot SSH exec channel (stateless: no cwd/env
+    /// carryover, no interaction with the persistent shell).
+    pub command: String,
+    #[serde(default = "default_run_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: u64,
+    #[serde(default = "default_true")]
+    pub strip_ansi: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SshExecOut {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i64>,
+    pub timed_out: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshReadyParams {
+    pub session_id: String,
+    #[serde(default = "default_ready_timeout")]
+    pub probe_timeout_ms: u64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SshReadyOut {
+    pub ready: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshRunAsyncParams {
+    pub session_id: String,
+    pub command: String,
+    #[serde(default = "default_async_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_max_output")]
+    pub max_output_bytes: u64,
+    #[serde(default = "default_true")]
+    pub strip_ansi: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SshRunAsyncOut {
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshTaskStatusParams {
+    pub task_id: String,
+    /// Block up to this long waiting for completion. Default 0 (instant).
+    #[serde(default)]
+    pub wait_ms: u64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SshTaskStatusOut {
+    /// "running" | "done" | "error"
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FileEditParams {
+    pub session_id: String,
+    pub path: String,
+    /// Exact text to find. Must match at least once; multiple matches are an
+    /// error unless replace_all is set.
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct FileEditOut {
+    pub replacements: u64,
+    /// The replaced region with ~2 lines of surrounding context.
+    pub context: String,
+}
+
 // ── Server ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -298,6 +407,13 @@ pub struct SshMcp {
     sessions: Arc<SessionManager>,
     audit: Arc<AuditLog>,
     max_sessions: usize,
+    tasks: Arc<tokio::sync::Mutex<std::collections::HashMap<String, TaskState>>>,
+    next_task: Arc<std::sync::atomic::AtomicU64>,
+}
+
+enum TaskState {
+    Running,
+    Done(Result<SshRunOut, String>),
 }
 
 impl SshMcp {
@@ -306,15 +422,29 @@ impl SshMcp {
             sessions: Arc::new(sessions),
             audit,
             max_sessions,
+            tasks: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            next_task: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    async fn live_session(&self, id: &str) -> Result<Arc<Session>, McpError> {
-        let session = self
-            .sessions
-            .get(id)
-            .await
-            .ok_or_else(|| invalid(format!("unknown session '{id}'; call ssh_open first")))?;
+    async fn find_session(&self, id_or_name: &str) -> Option<Arc<Session>> {
+        match self.sessions.get(id_or_name).await {
+            Some(s) => Some(s),
+            None => self
+                .sessions
+                .list()
+                .await
+                .into_iter()
+                .find(|s| s.name.as_deref() == Some(id_or_name)),
+        }
+    }
+
+    async fn live_session(&self, id_or_name: &str) -> Result<Arc<Session>, McpError> {
+        let session = self.find_session(id_or_name).await.ok_or_else(|| {
+            invalid(format!(
+                "unknown session '{id_or_name}'; call ssh_open first"
+            ))
+        })?;
         session.check_alive().map_err(invalid)?;
         Ok(session)
     }
@@ -414,6 +544,16 @@ impl SshMcp {
                 self.max_sessions
             )));
         }
+        if let Some(name) = p.name.as_deref()
+            && self
+                .sessions
+                .list()
+                .await
+                .iter()
+                .any(|s| s.name.as_deref() == Some(name))
+        {
+            return Err(invalid(format!("session name '{name}' is already in use")));
+        }
         let policy = match p.host_key_policy.as_str() {
             "accept-new" => HostKeyPolicy::AcceptNew,
             "off" => HostKeyPolicy::Off,
@@ -428,6 +568,7 @@ impl SshMcp {
                 host: p.host,
                 port: p.port.unwrap_or(0),
                 user: p.user.unwrap_or_default(),
+                name: p.name.clone(),
                 password: p.password,
                 private_key: p.private_key,
                 passphrase: p.passphrase,
@@ -454,6 +595,7 @@ impl SshMcp {
             shell_kind: s.shell_kind,
             target: s.target.clone(),
             auth_method: opened.auth_method.to_string(),
+            name: s.name.clone(),
         }))
     }
 
@@ -464,11 +606,15 @@ impl SshMcp {
         &self,
         Parameters(p): Parameters<SessionParams>,
     ) -> Result<Json<ClosedOut>, McpError> {
+        let found = self.find_session(&p.session_id).await;
+        let Some(session) = found else {
+            return Err(invalid(format!("unknown session '{}'", p.session_id)));
+        };
         let session = self
             .sessions
-            .remove(&p.session_id)
+            .remove(&session.id)
             .await
-            .ok_or_else(|| invalid(format!("unknown session '{}'", p.session_id)))?;
+            .expect("resolved session must exist");
         session.alive.store(false, Ordering::SeqCst);
         {
             let w = session.writer.lock().await;
@@ -489,6 +635,7 @@ impl SshMcp {
             .into_iter()
             .map(|s| ListEntry {
                 session_id: s.id.clone(),
+                name: s.name.clone(),
                 target: s.target.clone(),
                 shell_kind: s.shell_kind,
                 alive: s.alive.load(Ordering::SeqCst),
@@ -506,6 +653,27 @@ impl SshMcp {
         Parameters(p): Parameters<SshRunParams>,
     ) -> Result<Json<SshRunOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
+        Self::run_core(
+            &session,
+            &self.audit,
+            &p.command,
+            p.timeout_ms,
+            p.max_output_bytes,
+            p.strip_ansi,
+        )
+        .await
+        .map(Json)
+    }
+
+    /// Shared ssh_run implementation, also driven by ssh_run_async tasks.
+    async fn run_core(
+        session: &Arc<Session>,
+        audit: &AuditLog,
+        command: &str,
+        timeout_ms: u64,
+        max_output_bytes: u64,
+        strip_ansi: bool,
+    ) -> Result<SshRunOut, McpError> {
         if session.shell_kind != ShellKind::Posix {
             return Err(invalid(
                 "ssh_run requires a POSIX-like shell (probe failed at open); use ssh_type + ssh_expect instead",
@@ -554,7 +722,7 @@ impl SshMcp {
             &session.shared,
             start,
             pre_marker.as_bytes(),
-            Duration::from_millis(p.timeout_ms.min(5000)),
+            Duration::from_millis(timeout_ms.min(5000)),
         )
         .await;
         if !pre_ok {
@@ -576,11 +744,11 @@ impl SshMcp {
         {
             let w = session.writer.lock().await;
             if session.bracketed_paste {
-                w.data_bytes(format!("\u{1b}[200~{}\u{1b}[201~\n", p.command).into_bytes())
+                w.data_bytes(format!("\u{1b}[200~{}\u{1b}[201~\n", command).into_bytes())
                     .await
                     .map_err(internal)?;
             } else {
-                w.data_bytes(format!("{}\n", p.command).into_bytes())
+                w.data_bytes(format!("{}\n", command).into_bytes())
                     .await
                     .map_err(internal)?;
             }
@@ -595,7 +763,7 @@ impl SshMcp {
             .map_err(internal)?;
         }
 
-        let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let found = loop {
             {
                 let st = session.shared.inner.lock();
@@ -634,7 +802,7 @@ impl SshMcp {
             };
             (out, rc, to, offset)
         };
-        let output = if p.strip_ansi {
+        let output = if strip_ansi {
             ANSI_RE.replace_all(&output, "").into_owned()
         } else {
             output
@@ -644,20 +812,20 @@ impl SshMcp {
             .trim_start_matches(['\r', '\n'])
             .trim_end()
             .to_string();
-        let truncated = output.len() > p.max_output_bytes as usize;
-        let output = tail_chars(&output, p.max_output_bytes as usize);
-        self.audit.log(
+        let truncated = output.len() > max_output_bytes as usize;
+        let output = tail_chars(&output, max_output_bytes as usize);
+        audit.log(
             &session.id,
             "ssh_run",
-            serde_json::json!({"command": p.command, "exit_code": exit_code, "timed_out": timed_out}),
+            serde_json::json!({"command": command, "exit_code": exit_code, "timed_out": timed_out}),
         );
-        Ok(Json(SshRunOut {
+        Ok(SshRunOut {
             output,
             exit_code,
             timed_out,
             truncated,
             stream_offset,
-        }))
+        })
     }
 
     #[tool(
@@ -868,6 +1036,13 @@ impl SshMcp {
             Duration::from_millis(p.timeout_ms),
         )
         .await;
+        let screen = match p.tail_lines {
+            Some(n) if n > 0 => {
+                let lines: Vec<&str> = screen.lines().collect();
+                lines[lines.len().saturating_sub(n as usize)..].join("\n")
+            }
+            _ => screen,
+        };
         Ok(Json(SshScreenOut {
             screen,
             seq,
@@ -1054,5 +1229,296 @@ impl SshMcp {
             serde_json::json!({"remote_path": real, "local_path": p.local_path, "bytes": bytes}),
         );
         Ok(Json(TransferOut { bytes }))
+    }
+
+    #[tool(
+        description = "Execute a command via a one-shot SSH exec channel: stateless (no cwd/env carryover), protocol-level exit status, separate stdout/stderr, and completely isolated from the persistent shell (safe even while it runs an interactive program). Prefer this for simple read-only probes; use ssh_run when you need shell state or features."
+    )]
+    pub async fn ssh_exec(
+        &self,
+        Parameters(p): Parameters<SshExecParams>,
+    ) -> Result<Json<SshExecOut>, McpError> {
+        let session = self.live_session(&p.session_id).await?;
+        let channel = session
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(internal)?;
+        channel
+            .exec(false, p.command.as_str())
+            .await
+            .map_err(internal)?;
+        let (mut read, write) = channel.split();
+        let deadline = Instant::now() + Duration::from_millis(p.timeout_ms);
+        let (mut stdout, mut stderr, mut exit_code, mut timed_out) =
+            (Vec::new(), Vec::new(), None, false);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                timed_out = true;
+                break;
+            }
+            match tokio::time::timeout(remaining, read.wait()).await {
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+                Ok(Some(msg)) => match msg {
+                    russh::ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                        stderr.extend_from_slice(&data)
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => {
+                        exit_code = Some(exit_status as i64)
+                    }
+                    // Do NOT break on Eof: OpenSSH sends exit-status between
+                    // Eof and Close when the command wrote to stderr.
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                },
+                Ok(None) => break,
+            }
+        }
+        if timed_out {
+            let _ = write.close().await;
+        }
+        let clean = |bytes: Vec<u8>| -> String {
+            let s = String::from_utf8_lossy(&bytes).into_owned();
+            let s = if p.strip_ansi {
+                ANSI_RE.replace_all(&s, "").into_owned()
+            } else {
+                s
+            };
+            tail_chars(s.trim_end(), p.max_output_bytes as usize)
+        };
+        let truncated = stdout.len() > p.max_output_bytes as usize
+            || stderr.len() > p.max_output_bytes as usize;
+        self.audit.log(
+            &session.id,
+            "ssh_exec",
+            serde_json::json!({"command": p.command, "exit_code": exit_code, "timed_out": timed_out}),
+        );
+        Ok(Json(SshExecOut {
+            stdout: clean(stdout),
+            stderr: clean(stderr),
+            exit_code,
+            timed_out,
+            truncated,
+        }))
+    }
+
+    #[tool(
+        description = "Probe whether the shell is at a prompt (ready to accept commands). Writes one harmless probe line; if the shell or a foreground program does not answer within probe_timeout_ms, returns ready=false. Use before ssh_type-driven interactive sequences."
+    )]
+    pub async fn ssh_ready(
+        &self,
+        Parameters(p): Parameters<SshReadyParams>,
+    ) -> Result<Json<SshReadyOut>, McpError> {
+        let session = self.live_session(&p.session_id).await?;
+        let _io = session.io_lock.lock().await;
+        let start = session.shared.inner.lock().stream.end_offset();
+        let tok = format!("{:08x}", rand::random::<u32>());
+        let marker = format!("__SPM_RDY_{tok}__");
+        {
+            let w = session.writer.lock().await;
+            // %s indirection: echo of this line cannot false-positive the wait.
+            w.data_bytes(format!(" printf '__SPM_RDY_%s__\\n' {tok}\n").into_bytes())
+                .await
+                .map_err(internal)?;
+        }
+        let ready = session::wait_stream_contains(
+            &session.shared,
+            start,
+            marker.as_bytes(),
+            Duration::from_millis(p.probe_timeout_ms),
+        )
+        .await;
+        Ok(Json(SshReadyOut { ready }))
+    }
+
+    #[tool(
+        description = "Start a command in the persistent shell without blocking; returns task_id. Poll with ssh_task_status (optionally with wait_ms). Same semantics as ssh_run (state persists, at-prompt precondition); the task holds the shell until done, so avoid other ssh_run calls in the meantime (ssh_exec, ssh_screen, ssh_expect, file tools remain usable)."
+    )]
+    pub async fn ssh_run_async(
+        &self,
+        Parameters(p): Parameters<SshRunAsyncParams>,
+    ) -> Result<Json<SshRunAsyncOut>, McpError> {
+        let session = self.live_session(&p.session_id).await?;
+        let task_id = format!("t{}", self.next_task.fetch_add(1, Ordering::SeqCst) + 1);
+        self.tasks
+            .lock()
+            .await
+            .insert(task_id.clone(), TaskState::Running);
+        let tasks = self.tasks.clone();
+        let audit = self.audit.clone();
+        let tid = task_id.clone();
+        let command = p.command.clone();
+        tokio::spawn(async move {
+            let result = Self::run_core(
+                &session,
+                &audit,
+                &command,
+                p.timeout_ms,
+                p.max_output_bytes,
+                p.strip_ansi,
+            )
+            .await
+            .map_err(|e| e.to_string());
+            tasks.lock().await.insert(tid, TaskState::Done(result));
+        });
+        Ok(Json(SshRunAsyncOut { task_id }))
+    }
+
+    #[tool(
+        description = "Check a background task started by ssh_run_async. With wait_ms > 0, blocks until the task completes or the wait elapses. Returns status running/done/error plus output and exit_code when finished."
+    )]
+    pub async fn ssh_task_status(
+        &self,
+        Parameters(p): Parameters<SshTaskStatusParams>,
+    ) -> Result<Json<SshTaskStatusOut>, McpError> {
+        let deadline = Instant::now() + Duration::from_millis(p.wait_ms);
+        loop {
+            {
+                let tasks = self.tasks.lock().await;
+                match tasks.get(&p.task_id) {
+                    None => {
+                        return Err(invalid(format!(
+                            "unknown task '{}' (from ssh_run_async)",
+                            p.task_id
+                        )));
+                    }
+                    Some(TaskState::Done(Ok(out))) => {
+                        return Ok(Json(SshTaskStatusOut {
+                            status: "done".into(),
+                            output: Some(out.output.clone()),
+                            exit_code: out.exit_code,
+                            timed_out: Some(out.timed_out),
+                            error: None,
+                        }));
+                    }
+                    Some(TaskState::Done(Err(e))) => {
+                        return Ok(Json(SshTaskStatusOut {
+                            status: "error".into(),
+                            output: None,
+                            exit_code: None,
+                            timed_out: None,
+                            error: Some(e.clone()),
+                        }));
+                    }
+                    Some(TaskState::Running) => {}
+                }
+            }
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Ok(Json(SshTaskStatusOut {
+                    status: "running".into(),
+                    output: None,
+                    exit_code: None,
+                    timed_out: None,
+                    error: None,
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tool(
+        description = "Surgical text replacement in a remote file (like a local Edit tool): finds old_string exactly and replaces it. Requires the matched region to be covered by a prior file_read (read-before-write guard); replace_all additionally requires full-file coverage. Fails when old_string is absent or matches multiple times (unless replace_all). UTF-8 text only, 16 MiB cap."
+    )]
+    pub async fn file_edit(
+        &self,
+        Parameters(p): Parameters<FileEditParams>,
+    ) -> Result<Json<FileEditOut>, McpError> {
+        if p.old_string.is_empty() {
+            return Err(invalid("old_string must not be empty"));
+        }
+        let session = self.live_session(&p.session_id).await?;
+        let mut guard = Self::sftp(&session).await?;
+        let sftp = guard.as_mut().unwrap();
+        let real = sftp
+            .canonicalize(&p.path)
+            .await
+            .unwrap_or_else(|_| p.path.clone());
+        let path_lock = session.write_lock_for(&real);
+        let _wg = path_lock.lock().await;
+        let meta = sftp
+            .metadata(&real)
+            .await
+            .map_err(|e| invalid(format!("cannot stat {real}: {e}")))?;
+        let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
+        if fp.0 > 16 * 1024 * 1024 {
+            return Err(invalid(format!(
+                "{real} is too large for file_edit (16 MiB cap); use ssh_run with sed instead"
+            )));
+        }
+        let data = sftp.read(&real).await.map_err(internal)?;
+        let content = String::from_utf8(data)
+            .map_err(|_| invalid(format!("{real} is not valid UTF-8; file_edit is text-only")))?;
+        let matches: Vec<usize> = content
+            .match_indices(&p.old_string)
+            .map(|(i, _)| i)
+            .collect();
+        if matches.is_empty() {
+            return Err(invalid(format!("old_string not found in {real}")));
+        }
+        if matches.len() > 1 && !p.replace_all {
+            return Err(invalid(format!(
+                "old_string matches {} times in {real}; pass replace_all=true or include more surrounding context",
+                matches.len()
+            )));
+        }
+        // Read-before-write guard: matched byte ranges must be read-covered
+        // under the current fingerprint; replace_all = full-file coverage.
+        let missing: Vec<(u64, u64)> = {
+            let reads = session.reads.lock();
+            let empty = crate::session::ReadCoverage::default();
+            let cov = reads.get(&real).unwrap_or(&empty);
+            if p.replace_all {
+                cov.missing((0, fp.0), fp)
+            } else {
+                matches
+                    .iter()
+                    .flat_map(|&i| cov.missing((i as u64, (i + p.old_string.len()) as u64), fp))
+                    .collect()
+            }
+        };
+        if !missing.is_empty() {
+            let ranges = missing
+                .iter()
+                .map(|(s, e)| format!("[{s}, {e})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(invalid(format!(
+                "file_edit denied: matched region of {real} not covered by prior file_read (missing {ranges}) or changed since read; read the region you intend to edit first"
+            )));
+        }
+        let first = matches[0];
+        let new_content = if p.replace_all {
+            content.replace(&p.old_string, &p.new_string)
+        } else {
+            content.replacen(&p.old_string, &p.new_string, 1)
+        };
+        let mut file = sftp
+            .create(&real)
+            .await
+            .map_err(|e| create_error(e, &real))?;
+        file.write_all(new_content.as_bytes())
+            .await
+            .map_err(internal)?;
+        let _ = file.sync_all().await;
+        // Context: ±2 lines around the first replacement in the NEW content.
+        let lines: Vec<&str> = new_content.lines().collect();
+        let hit_line = new_content[..first].lines().count().saturating_sub(1);
+        let lo = hit_line.saturating_sub(2);
+        let hi = (hit_line + 3).min(lines.len());
+        let context = lines[lo..hi].join("\n");
+        self.audit.log(
+            &session.id,
+            "file_edit",
+            serde_json::json!({"path": real, "replacements": matches.len(), "replace_all": p.replace_all}),
+        );
+        Ok(Json(FileEditOut {
+            replacements: matches.len() as u64,
+            context,
+        }))
     }
 }

@@ -34,11 +34,14 @@ cargo install ssh-pty-mcp
 
 | Tool | Purpose |
 |---|---|
-| `ssh_open` / `ssh_close` / `ssh_list` | Session lifecycle (key / SSH-agent / password auth, `~/.ssh/config` resolution, known_hosts accept-new) |
+| `ssh_open` / `ssh_close` / `ssh_list` | Session lifecycle (key / SSH-agent / password auth, `~/.ssh/config` resolution, known_hosts accept-new, optional session alias) |
 | `ssh_run` | Run a command in the persistent shell; returns clean output + exit code |
+| `ssh_run_async` / `ssh_task_status` | Background a persistent-shell command; poll for completion |
+| `ssh_exec` | One-shot stateless exec channel (protocol exit status, split stdout/stderr, isolated from the shell) |
+| `ssh_ready` | Probe whether the shell is at a prompt |
 | `ssh_type` / `ssh_press` / `ssh_signal` | Type text, press named keys (`ctrl+c`, `f5`, `up`...), send signals |
-| `ssh_expect` / `ssh_screen` | Wait for a regex on stream/screen; read the rendered screen |
-| `file_read` / `file_write` / `ssh_upload` / `ssh_download` | SFTP file ops. `file_write(overwrite)` and overwrites via `ssh_upload` require a prior full `file_read` — enforced |
+| `ssh_expect` / `ssh_screen` | Wait for a regex on stream/screen; read the rendered screen (full or `tail_lines`) |
+| `file_read` / `file_write` / `file_edit` / `ssh_upload` / `ssh_download` | SFTP file ops. `file_write(overwrite)`, overwrites via `ssh_upload`, and `file_edit` require prior read coverage — enforced |
 
 ## Audit log
 

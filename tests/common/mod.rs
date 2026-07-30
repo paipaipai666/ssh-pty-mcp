@@ -65,6 +65,7 @@ pub fn ssh_open_params(port: u16) -> SshOpenParams {
         host: "127.0.0.1".into(),
         port: Some(port),
         user: Some("test".into()),
+        name: None,
         password: Some("testpass".into()),
         private_key: None,
         passphrase: None,

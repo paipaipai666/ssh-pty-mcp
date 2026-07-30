@@ -74,7 +74,8 @@ impl Shared {
 
 pub struct Session {
     pub id: String,
-    pub target: String, // "user@host:port"
+    pub target: String,       // "user@host:port"
+    pub name: Option<String>, // optional human alias, usable anywhere session_id is
     pub shell_kind: ShellKind,
     pub shared: Arc<Shared>,
     pub writer: tokio::sync::Mutex<russh::ChannelWriteHalf<russh::client::Msg>>,

@@ -28,6 +28,7 @@ pub struct ConnectParams {
     pub port: u16,
     /// Empty = unset (resolve via ssh config).
     pub user: String,
+    pub name: Option<String>,
     pub password: Option<String>,
     pub private_key: Option<String>,
     pub passphrase: Option<String>,
@@ -322,6 +323,7 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
     let mut session = Session {
         id: manager.next_id(),
         target,
+        name: params.name.clone(),
         shell_kind: ShellKind::Unknown,
         shared: shared.clone(),
         writer: tokio::sync::Mutex::new(write_half),
