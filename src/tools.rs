@@ -511,6 +511,31 @@ static ANSI_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
         .unwrap()
 });
 
+/// dev:inode identity of a remote path, via a one-shot exec channel
+/// (SFTP v3 attributes carry no inode). None when the path does not exist
+/// or stat is unavailable.
+async fn dev_inode(session: &Session, path: &str) -> Option<String> {
+    let q = path.replace('\'', "'\\''");
+    let ch = session.handle.channel_open_session().await.ok()?;
+    ch.exec(
+        false,
+        format!("stat -c '%d:%i' -- '{q}' 2>/dev/null || stat -f '%d:%i' -- '{q}'"),
+    )
+    .await
+    .ok()?;
+    let (mut read, _write) = ch.split();
+    let mut out = Vec::new();
+    while let Some(msg) = read.wait().await {
+        match msg {
+            russh::ChannelMsg::Data { data } => out.extend_from_slice(&data),
+            russh::ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+    let s = String::from_utf8_lossy(&out).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
 /// Wrap SFTP create/open failures: name the missing parent directory when
 /// that is the actual cause (raw SFTP "no such file" is ambiguous).
 fn create_error<E: std::fmt::Display>(e: E, real: &str) -> McpError {
@@ -1265,7 +1290,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Execute a command via a one-shot SSH exec channel: stateless (no cwd/env carryover), protocol-level exit status, separate stdout/stderr, and completely isolated from the persistent shell (safe even while it runs an interactive program). Prefer this for simple read-only probes; use ssh_shell when you need shell state or features."
+        description = "Execute a command via a one-shot SSH exec channel: stateless (no cwd/env carryover), protocol-level exit status, separate stdout/stderr, and completely isolated from the persistent shell (safe even while it runs an interactive program). Prefer this for simple read-only probes; use ssh_shell when you need shell state or features. On timeout the local channel closes but the REMOTE process may keep running (OpenSSH does not deliver signals to pty-less execs) — clean up with ssh_exec(\"pkill -f '<cmd>'\") or ssh_shell('kill -<SIG> <pid>')."
     )]
     pub async fn ssh_exec(
         &self,
@@ -1523,6 +1548,17 @@ impl SshMcp {
                     "{real_from} and {real_to} are the same file; refusing to copy"
                 )));
             }
+            // Hardlinks share an inode across different paths — path
+            // comparison alone is not enough.
+            if let (Some(a), Some(b)) = (
+                dev_inode(&from, &real_from).await,
+                dev_inode(&from, &real_to).await,
+            ) && a == b
+            {
+                return Err(invalid(format!(
+                    "{real_from} and {real_to} are the same file (hardlink); refusing to copy"
+                )));
+            }
             let path_lock = to.write_lock_for(&real_to);
             let _wg = path_lock.lock().await;
             if let Ok(meta) = s.metadata(&real_to).await {
@@ -1576,6 +1612,17 @@ impl SshMcp {
         if from.target == to.target && real_from == real_to {
             return Err(invalid(format!(
                 "{real_from} and {real_to} are the same file; refusing to copy"
+            )));
+        }
+        if from.target == to.target
+            && let (Some(a), Some(b)) = (
+                dev_inode(&from, &real_from).await,
+                dev_inode(&to, &real_to).await,
+            )
+            && a == b
+        {
+            return Err(invalid(format!(
+                "{real_from} and {real_to} are the same file (hardlink); refusing to copy"
             )));
         }
         let path_lock = to.write_lock_for(&real_to);

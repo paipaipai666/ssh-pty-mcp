@@ -1013,6 +1013,81 @@ async fn e2e() {
     );
     assert!(s.screen.contains("CLEAN_SCREEN"), "29: real output kept");
 
+    // Scenario 30: hardlink self-copy is refused via dev:inode comparison.
+    run(
+        &mcp,
+        &id,
+        "echo data > /tmp/hl_a.txt && ln /tmp/hl_a.txt /tmp/hl_b.txt",
+    )
+    .await;
+    let err = mcp
+        .ssh_copy(Parameters(SshCopyParams {
+            from_session: id.clone(),
+            from_path: "/tmp/hl_a.txt".into(),
+            to_session: id.clone(),
+            to_path: "/tmp/hl_b.txt".into(),
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("same file"),
+        "30: hardlink refused, got {err}"
+    );
+    let r = mcp
+        .file_read(Parameters(FileReadParams {
+            session_id: id.clone(),
+            path: "/tmp/hl_a.txt".into(),
+            offset: 0,
+            limit: 262144,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(r.content.trim(), "data", "30: source intact");
+
+    // Scenario 31: ssh_exec timeout leaks the remote process; pkill cleans it.
+    let x = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: id.clone(),
+            command: "sleep 30".into(),
+            timeout_ms: 1500,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(x.timed_out, "31: exec times out");
+    let check = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: id.clone(),
+            command: "ps aux | grep '[s]leep 30' | wc -l".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(
+        check.stdout.trim().parse::<u32>().unwrap_or(0) >= 1,
+        "31: leak visible, got {:?}",
+        check.stdout
+    );
+    let clean = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: id.clone(),
+            command: "pkill -f 'sleep 30'".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(clean.exit_code == Some(0), "31: documented cleanup works");
+
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(
         SessionManager::default(),
