@@ -14,7 +14,7 @@ use ssh_pty_mcp::tools::*;
 
 #[path = "common/mod.rs"]
 mod common;
-use common::{docker_ok, ssh_open_params, start_container};
+use common::{docker_ok, run_docker, ssh_open_params, start_container};
 
 fn params(port: u16) -> ConnectParams {
     ConnectParams {
@@ -22,6 +22,8 @@ fn params(port: u16) -> ConnectParams {
         port,
         user: "test".into(),
         name: None,
+        proxy_jump: None,
+        mode: ssh_pty_mcp::session::SessionMode::Unrestricted,
         password: Some("testpass".into()),
         private_key: None,
         passphrase: None,
@@ -1087,6 +1089,183 @@ async fn e2e() {
         .unwrap()
         .0;
     assert!(clean.exit_code == Some(0), "31: documented cleanup works");
+
+    // Scenario 32: servers.toml registry + ssh_list_servers.
+    let toml_dir = tempfile::tempdir().unwrap();
+    let toml_path = toml_dir.path().join("servers.toml");
+    std::fs::write(
+        &toml_path,
+        format!(
+            "[servers.sbx]\nhost = \"127.0.0.1\"\nport = {port}\nuser = \"test\"\npassword = \"testpass\"\n"
+        ),
+    )
+    .unwrap();
+    unsafe {
+        std::env::set_var("SSH_PTY_MCP_SERVERS", &toml_path);
+    }
+    let listed = mcp.ssh_list_servers().await.unwrap().0;
+    let sbx = listed
+        .servers
+        .iter()
+        .find(|s| s.name == "sbx")
+        .expect("32: sbx listed");
+    assert_eq!(sbx.port, Some(port));
+    let opened = mcp
+        .ssh_open(Parameters(SshOpenParams {
+            server: Some("sbx".into()),
+            ..ssh_open_params(port)
+        }))
+        .await
+        .expect("32: open via registry");
+    let r = run(&mcp, &opened.0.session_id, "echo VIA_REGISTRY").await;
+    assert!(
+        r.output.contains("VIA_REGISTRY"),
+        "32: registry session works"
+    );
+    mcp.ssh_close(Parameters(sid(&opened.0.session_id)))
+        .await
+        .unwrap();
+
+    // Scenario 33: ProxyJump through a bastion to an unpublished container.
+    let target_id = run_docker(&["run", "-d", "--rm", "spm-e2e"]);
+    struct TargetGuard(String);
+    impl Drop for TargetGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["rm", "-f", &self.0]).status();
+        }
+    }
+    let _tg = TargetGuard(target_id.clone());
+    let target_ip = run_docker(&[
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        &target_id,
+    ]);
+    std::fs::write(
+        &toml_path,
+        format!(
+            "[servers.bastion]\nhost = \"127.0.0.1\"\nport = {port}\nuser = \"test\"\npassword = \"testpass\"\n"
+        ),
+    )
+    .unwrap();
+    let mut jumped = None;
+    let mut last_err = String::new();
+    for _ in 0..15 {
+        match mcp
+            .ssh_open(Parameters(SshOpenParams {
+                host: Some(target_ip.clone()),
+                port: Some(22), // target's sshd, inside the docker network
+                proxy_jump: Some("bastion".into()),
+                ..ssh_open_params(port)
+            }))
+            .await
+        {
+            Ok(o) => {
+                jumped = Some(o);
+                break;
+            }
+            Err(e) => {
+                last_err = e.message.to_string();
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+        }
+    }
+    let jumped = jumped.unwrap_or_else(|| panic!("33: open via proxyjump: {last_err}"));
+    let r = run(&mcp, &jumped.0.session_id, "hostname").await;
+    assert!(
+        r.output.contains(&target_id[..12]),
+        "33: landed on target behind bastion, got {:?}",
+        r.output
+    );
+    mcp.ssh_close(Parameters(sid(&jumped.0.session_id)))
+        .await
+        .unwrap();
+
+    // Scenario 34: readonly mode blocks dangerous commands and mutations.
+    let ro = mcp
+        .ssh_open(Parameters(SshOpenParams {
+            mode: Some("readonly".into()),
+            ..ssh_open_params(port)
+        }))
+        .await
+        .expect("34: readonly open");
+    let roid = ro.0.session_id;
+    let err = mcp
+        .ssh_shell(Parameters(SshShellParams {
+            session_id: roid.clone(),
+            command: "rm -rf /tmp/anything".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("readonly"),
+        "34: rm blocked, got {err}"
+    );
+    let r = run(&mcp, &roid, "df -h /").await;
+    assert_eq!(r.exit_code, Some(0), "34: read-only command allowed");
+    let err = mcp
+        .file_write(Parameters(FileWriteParams {
+            session_id: roid.clone(),
+            path: "/tmp/ro.txt".into(),
+            content: "x".into(),
+            mode: "overwrite".into(),
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("readonly"),
+        "34: file_write blocked, got {err}"
+    );
+    let err = mcp
+        .ssh_exec(Parameters(SshExecParams {
+            session_id: roid.clone(),
+            command: "kill -9 1".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("readonly"),
+        "34: exec dangerous blocked, got {err}"
+    );
+    mcp.ssh_close(Parameters(sid(&roid))).await.unwrap();
+
+    // Scenario 35: restricted mode allowlist.
+    let rs = mcp
+        .ssh_open(Parameters(SshOpenParams {
+            mode: Some("restricted".into()),
+            allow: vec!["^df".into()],
+            ..ssh_open_params(port)
+        }))
+        .await
+        .expect("35: restricted open");
+    let rsid = rs.0.session_id;
+    let r = run(&mcp, &rsid, "df -h /").await;
+    assert_eq!(r.exit_code, Some(0), "35: allowlisted command allowed");
+    let err = mcp
+        .ssh_shell(Parameters(SshShellParams {
+            session_id: rsid.clone(),
+            command: "ls /tmp".into(),
+            timeout_ms: 10000,
+            max_output_bytes: 65536,
+            strip_ansi: true,
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("restricted"),
+        "35: non-allowlisted blocked, got {err}"
+    );
+    mcp.ssh_close(Parameters(sid(&rsid))).await.unwrap();
 
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(

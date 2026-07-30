@@ -75,8 +75,14 @@ fn default_async_timeout() -> u64 {
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct SshOpenParams {
-    /// Hostname, IP, or a Host alias from ~/.ssh/config.
-    pub host: String,
+    /// Named server from ~/.ssh-pty-mcp/servers.toml. Explicit params below
+    /// override registry values.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Hostname, IP, or a Host alias from ~/.ssh/config. Optional when
+    /// `server` provides one.
+    #[serde(default)]
+    pub host: Option<String>,
     /// SSH port. Omit to use ~/.ssh/config or 22.
     #[serde(default)]
     pub port: Option<u16>,
@@ -87,6 +93,18 @@ pub struct SshOpenParams {
     /// session_id is accepted.
     #[serde(default)]
     pub name: Option<String>,
+    /// ProxyJump spec: "user@host[:port]", or an alias from
+    /// servers.toml / ~/.ssh/config.
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+    /// Command policy: "unrestricted" (default), "readonly" (mutating tools
+    /// blocked + built-in dangerous command list refused), "restricted"
+    /// (commands must match `allow` regexes).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Allowlist regexes for mode="restricted".
+    #[serde(default)]
+    pub allow: Vec<String>,
     /// Password auth (tried after key/agent). Never logged.
     #[serde(default)]
     pub password: Option<String>,
@@ -120,6 +138,7 @@ pub struct SshOpenOut {
     pub target: String,
     pub auth_method: String,
     pub name: Option<String>,
+    pub mode: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -140,6 +159,11 @@ pub struct ListEntry {
     pub shell_kind: ShellKind,
     pub alive: bool,
     pub idle_secs: u64,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListServersOut {
+    pub servers: Vec<crate::servers::ServerSummary>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -551,6 +575,21 @@ fn create_error<E: std::fmt::Display>(e: E, real: &str) -> McpError {
     internal(msg)
 }
 
+fn pick<T: Clone>(explicit: &Option<T>, entry: Option<T>) -> Option<T> {
+    explicit.clone().or(entry)
+}
+
+/// Readonly-mode gate for mutating file tools.
+fn check_mutation(session: &Session, tool: &str) -> Result<(), McpError> {
+    if matches!(session.mode, crate::session::SessionMode::ReadOnly) {
+        Err(invalid(format!(
+            "blocked by session mode=readonly: {tool} is a mutating operation"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 /// Read-before-write guard: overwrite of an existing non-empty file requires
 /// full read coverage tagged with the current (size, mtime) fingerprint.
 fn guard_check(session: &Session, real: &str, fp: Fingerprint, tool: &str) -> Result<(), McpError> {
@@ -610,16 +649,93 @@ impl SshMcp {
                 )));
             }
         };
+        // Merge order: explicit params > servers.toml > ~/.ssh/config.
+        let entry = match p.server.as_deref() {
+            Some(name) => {
+                let e = crate::servers::load().servers.remove(name);
+                match e {
+                    Some(e) => Some(e),
+                    None => {
+                        return Err(invalid(format!(
+                            "server '{name}' not found in {}; call ssh_list_servers",
+                            crate::servers::servers_path().display()
+                        )));
+                    }
+                }
+            }
+            None => None,
+        };
+        let host = p
+            .host
+            .clone()
+            .or_else(|| entry.as_ref().and_then(|e| e.host.clone()));
+        let Some(host) = host else {
+            return Err(invalid(
+                "host is required (not supplied, not in servers.toml entry)",
+            ));
+        };
+        let mode_str = p
+            .mode
+            .clone()
+            .or_else(|| entry.as_ref().and_then(|e| e.mode.clone()))
+            .unwrap_or_else(|| "unrestricted".into());
+        let mut allow = if p.allow.is_empty() {
+            entry
+                .as_ref()
+                .and_then(|e| e.allow.clone())
+                .unwrap_or_default()
+        } else {
+            p.allow.clone()
+        };
+        let mode = match mode_str.as_str() {
+            "unrestricted" => crate::session::SessionMode::Unrestricted,
+            "readonly" => crate::session::SessionMode::ReadOnly,
+            "restricted" => {
+                if allow.is_empty() {
+                    return Err(invalid(
+                        "mode=restricted requires `allow` regexes (or `allow` in the servers.toml entry)",
+                    ));
+                }
+                let compiled: Result<Vec<_>, _> =
+                    allow.drain(..).map(|pat| regex::Regex::new(&pat)).collect();
+                let compiled =
+                    compiled.map_err(|e| invalid(format!("invalid allow regex: {e}")))?;
+                crate::session::SessionMode::Restricted(compiled)
+            }
+            other => {
+                return Err(invalid(format!(
+                    "mode must be unrestricted|readonly|restricted, got '{other}'"
+                )));
+            }
+        };
         let opened = connect::open(
             ConnectParams {
-                host: p.host,
-                port: p.port.unwrap_or(0),
-                user: p.user.unwrap_or_default(),
+                host,
+                port: p
+                    .port
+                    .or_else(|| entry.as_ref().and_then(|e| e.port))
+                    .unwrap_or(0),
+                user: pick(&p.user, entry.as_ref().and_then(|e| e.user.clone()))
+                    .unwrap_or_default(),
                 name: p.name.clone(),
-                password: p.password,
-                private_key: p.private_key,
-                passphrase: p.passphrase,
-                use_agent: p.use_agent,
+                proxy_jump: pick(
+                    &p.proxy_jump,
+                    entry.as_ref().and_then(|e| e.proxy_jump.clone()),
+                ),
+                mode,
+                password: pick(&p.password, entry.as_ref().and_then(|e| e.password.clone())),
+                private_key: pick(
+                    &p.private_key,
+                    entry.as_ref().and_then(|e| e.private_key.clone()),
+                ),
+                passphrase: pick(
+                    &p.passphrase,
+                    entry.as_ref().and_then(|e| e.passphrase.clone()),
+                ),
+                use_agent: entry
+                    .as_ref()
+                    .and_then(|e| e.use_agent)
+                    .unwrap_or(p.use_agent),
                 use_ssh_config: p.use_ssh_config,
                 host_key_policy: policy,
                 cols: p.cols,
@@ -629,7 +745,7 @@ impl SshMcp {
             &self.sessions,
         )
         .await
-        .map_err(internal)?;
+        .map_err(|e| internal(format!("{e:#}")))?;
         self.sessions.insert(opened.session.clone()).await;
         let s = &opened.session;
         self.audit.log(
@@ -643,6 +759,7 @@ impl SshMcp {
             target: s.target.clone(),
             auth_method: opened.auth_method.to_string(),
             name: s.name.clone(),
+            mode: s.mode.label().to_string(),
         }))
     }
 
@@ -671,6 +788,15 @@ impl SshMcp {
         self.audit
             .log(&session.id, "ssh_close", serde_json::json!({}));
         Ok(Json(ClosedOut { closed: true }))
+    }
+
+    #[tool(
+        description = "List configured servers from ~/.ssh-pty-mcp/servers.toml and Host aliases from ~/.ssh/config (passwords never shown). Open one with ssh_open(server=\"name\")."
+    )]
+    pub async fn ssh_list_servers(&self) -> Result<Json<ListServersOut>, McpError> {
+        Ok(Json(ListServersOut {
+            servers: crate::servers::list_summaries(),
+        }))
     }
 
     #[tool(description = "List all open sessions with their targets, shell kind, and liveness.")]
@@ -713,7 +839,7 @@ impl SshMcp {
         .map(Json)
     }
 
-    /// Shared ssh_shell implementation, also driven by ssh_shell_async tasks.
+    /// Shared ssh_run implementation, also driven by ssh_shell_async tasks.
     async fn run_core(
         session: &Arc<Session>,
         audit: &AuditLog,
@@ -722,10 +848,14 @@ impl SshMcp {
         max_output_bytes: u64,
         strip_ansi: bool,
     ) -> Result<SshShellOut, McpError> {
+        if let Some(reason) = session.mode.check(command) {
+            return Err(invalid(reason));
+        }
         if session.shell_kind != ShellKind::Posix {
-            return Err(invalid(
-                "ssh_shell requires a POSIX-like shell (probe failed at open); use ssh_type + ssh_expect instead",
-            ));
+            return Err(invalid(format!(
+                "ssh_shell requires a POSIX-like shell (this session is {:?}); use ssh_exec for one-shot commands or ssh_type + ssh_expect for interactive work",
+                session.shell_kind
+            )));
         }
         let _io = session.io_lock.lock().await;
         // Let any in-flight output/typing settle (avoids scaffolding colliding
@@ -1158,6 +1288,7 @@ impl SshMcp {
         Parameters(p): Parameters<FileWriteParams>,
     ) -> Result<Json<FileWriteOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
+        check_mutation(&session, "file_write")?;
         let overwrite = match p.mode.as_str() {
             "overwrite" => true,
             "append" => false,
@@ -1223,6 +1354,7 @@ impl SshMcp {
         Parameters(p): Parameters<TransferParams>,
     ) -> Result<Json<TransferOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
+        check_mutation(&session, "ssh_upload")?;
         let mut guard = Self::sftp(&session).await?;
         let sftp = guard.as_mut().unwrap();
         let real = sftp
@@ -1297,6 +1429,9 @@ impl SshMcp {
         Parameters(p): Parameters<SshExecParams>,
     ) -> Result<Json<SshExecOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
+        if let Some(reason) = session.mode.check(&p.command) {
+            return Err(invalid(reason));
+        }
         let channel = session
             .handle
             .channel_open_session()
@@ -1530,6 +1665,7 @@ impl SshMcp {
     ) -> Result<Json<TransferOut>, McpError> {
         let from = self.live_session(&p.from_session).await?;
         let to = self.live_session(&p.to_session).await?;
+        check_mutation(&to, "ssh_copy")?;
 
         // Same session: one SFTP lock, one code path.
         if from.id == to.id {
@@ -1665,6 +1801,7 @@ impl SshMcp {
             return Err(invalid("old_string must not be empty"));
         }
         let session = self.live_session(&p.session_id).await?;
+        check_mutation(&session, "file_edit")?;
         let mut guard = Self::sftp(&session).await?;
         let sftp = guard.as_mut().unwrap();
         let real = sftp

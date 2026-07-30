@@ -1,6 +1,6 @@
 [package]
 name = "ssh-pty-mcp"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -29,6 +29,7 @@ shellexpand = "3"
 ssh2-config = "0.2"
 parking_lot = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

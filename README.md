@@ -49,6 +49,46 @@ Every command the agent runs is appended to `~/.ssh-pty-mcp/audit.jsonl`
 (override with `--audit-log <path>`). Typed text is redacted; passwords are
 never logged.
 
+## Named servers & ProxyJump
+
+`~/.ssh-pty-mcp/servers.toml` (override with `SSH_PTY_MCP_SERVERS`):
+
+```toml
+[servers.prod]
+host = "203.0.113.10"
+port = 22
+user = "deploy"
+private_key = "~/.ssh/id_ed25519"   # or password = "..." (chmod 600!)
+proxy_jump = "bastion"               # alias, or user@host[:port]
+mode = "readonly"                    # unrestricted|readonly|restricted
+allow = ["^df", "^ps"]               # allowlist regexes for restricted
+
+[servers.bastion]
+host = "198.51.100.5"
+user = "jump"
+```
+
+Then: `ssh_open(server="prod")`. Merge order: explicit params > servers.toml >
+~/.ssh/config (including its `ProxyJump`). `ssh_list_servers` shows all
+configured servers (no secrets).
+
+## Security modes
+
+Per session, at `ssh_open`:
+
+- `unrestricted` (default): everything allowed.
+- `readonly`: mutating tools (`file_write`/`file_edit`/`ssh_upload`/`ssh_copy`)
+  blocked; commands matching the built-in dangerous list (`rm`, `dd`, `mkfs`,
+  `shutdown`, `systemctl`, `kill`, `chmod`...) refused in `ssh_shell`/`ssh_exec`.
+- `restricted`: commands must match at least one `allow` regex.
+
+## Windows targets
+
+`ssh_shell` is POSIX-only (its sentinel pipeline depends on sh semantics).
+Sessions probing as `cmd`/`powershell` get a precise error pointing to
+`ssh_exec` — which works on Windows targets today (runs via `cmd /c`,
+no readline involved): multi-line commands, clean output, protocol exit code.
+
 ## Local sandbox + WAN simulation
 
 A disposable SSH target for agent testing (no real VPS needed):

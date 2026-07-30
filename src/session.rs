@@ -17,7 +17,66 @@ use crate::ringbuf::RingBuf;
 #[serde(rename_all = "lowercase")]
 pub enum ShellKind {
     Posix,
+    Cmd,
+    PowerShell,
     Unknown,
+}
+
+/// Per-session command policy, set at ssh_open.
+#[derive(Debug, Clone, Default)]
+pub enum SessionMode {
+    /// Everything allowed (current behavior).
+    #[default]
+    Unrestricted,
+    /// Mutating file tools blocked; commands matching the built-in dangerous
+    /// list are refused.
+    ReadOnly,
+    /// Every command must match at least one allowlist regex.
+    Restricted(Vec<regex::Regex>),
+}
+
+impl SessionMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SessionMode::Unrestricted => "unrestricted",
+            SessionMode::ReadOnly => "readonly",
+            SessionMode::Restricted(_) => "restricted",
+        }
+    }
+
+    /// Built-in dangerous-command patterns for ReadOnly.
+    pub fn dangerous() -> &'static regex::Regex {
+        static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"\b(rm|rmdir|mkfs\S*|dd|shutdown|reboot|halt|poweroff|init|kill|killall|pkill|systemctl|service|chmod|chown|chgrp|useradd|userdel|groupadd|groupdel|passwd|iptables|fdisk|parted|mount|umount|swapoff|crontab)\b",
+            )
+            .unwrap()
+        });
+        &RE
+    }
+
+    /// None = allowed; Some(reason) = refused.
+    pub fn check(&self, command: &str) -> Option<String> {
+        match self {
+            SessionMode::Unrestricted => None,
+            SessionMode::ReadOnly => SessionMode::dangerous().find(command).map(|m| {
+                format!(
+                    "blocked by session mode=readonly: matched dangerous pattern '{}'",
+                    m.as_str()
+                )
+            }),
+            SessionMode::Restricted(allow) => {
+                if allow.iter().any(|re| re.is_match(command)) {
+                    None
+                } else {
+                    Some(
+                        "blocked by session mode=restricted: command matches no allowlist pattern"
+                            .to_string(),
+                    )
+                }
+            }
+        }
+    }
 }
 
 pub struct Shared {
@@ -76,10 +135,13 @@ pub struct Session {
     pub id: String,
     pub target: String,       // "user@host:port"
     pub name: Option<String>, // optional human alias, usable anywhere session_id is
+    pub mode: SessionMode,
     pub shell_kind: ShellKind,
     pub shared: Arc<Shared>,
     pub writer: tokio::sync::Mutex<russh::ChannelWriteHalf<russh::client::Msg>>,
     pub handle: russh::client::Handle<crate::connect::ClientHandler>,
+    /// Bastion connection, kept alive for the session's lifetime (ProxyJump).
+    pub bastion: Option<Box<russh::client::Handle<crate::connect::ClientHandler>>>,
     pub sftp: tokio::sync::Mutex<Option<russh_sftp::client::SftpSession>>,
     pub io_lock: tokio::sync::Mutex<()>,
     pub reads: Mutex<HashMap<String, ReadCoverage>>,

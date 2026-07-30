@@ -13,7 +13,7 @@ use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::{self, PrivateKeyWithHashAlg, ssh_key};
 use ssh2_config::{ParseRule, SshConfig};
 
-use crate::session::{self, Session, SessionManager, Shared, ShellKind};
+use crate::session::{self, Session, SessionManager, SessionMode, Shared, ShellKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostKeyPolicy {
@@ -29,6 +29,8 @@ pub struct ConnectParams {
     /// Empty = unset (resolve via ssh config).
     pub user: String,
     pub name: Option<String>,
+    pub proxy_jump: Option<String>,
+    pub mode: SessionMode,
     pub password: Option<String>,
     pub private_key: Option<String>,
     pub passphrase: Option<String>,
@@ -84,10 +86,11 @@ struct Resolved {
     port: u16,
     user: String,
     private_key: Option<String>,
+    proxy_jump: Option<String>,
 }
 
 /// Load ~/.ssh/config (parse_default_file is unix-gated in ssh2-config).
-fn load_ssh_config() -> Option<SshConfig> {
+pub fn load_ssh_config() -> Option<SshConfig> {
     #[cfg(unix)]
     {
         SshConfig::parse_default_file(ParseRule::STRICT).ok()
@@ -109,6 +112,7 @@ fn resolve(params: &ConnectParams) -> anyhow::Result<Resolved> {
         port: params.port,
         user: params.user.clone(),
         private_key: params.private_key.clone(),
+        proxy_jump: params.proxy_jump.clone(),
     };
     if params.use_ssh_config
         && let Some(cfg) = load_ssh_config()
@@ -132,6 +136,12 @@ fn resolve(params: &ConnectParams) -> anyhow::Result<Resolved> {
             && let Some(first) = files.first()
         {
             r.private_key = Some(first.to_string_lossy().into_owned());
+        }
+        // ProxyJump lands in ssh2-config's ignored_fields bucket.
+        if r.proxy_jump.is_none()
+            && let Some(jump) = p.ignored_fields.get("proxyjump")
+        {
+            r.proxy_jump = jump.first().cloned();
         }
     }
     if r.port == 0 {
@@ -269,6 +279,62 @@ async fn authenticate(
     bail!("authentication failed for {}@{}:{}", r.user, r.host, r.port)
 }
 
+/// Parse a proxy_jump spec: "user@host[:port]", "host[:port]", or an alias
+/// resolved via servers.toml / ~/.ssh/config.
+fn resolve_jump(spec: &str, base: &ConnectParams) -> Resolved {
+    // servers.toml alias
+    let entry = crate::servers::load().servers.remove(spec);
+    if let Some(e) = entry {
+        let mut r = Resolved {
+            host: e.host.clone().unwrap_or_else(|| spec.to_string()),
+            port: e.port.unwrap_or(22),
+            user: e.user.clone().unwrap_or_else(|| base.user.clone()),
+            private_key: e.private_key.clone(),
+            proxy_jump: None,
+        };
+        if let Some(cfg) = load_ssh_config() {
+            let p = cfg.query(&r.host);
+            if let Some(hn) = p.host_name
+                && !hn.is_empty()
+            {
+                r.host = hn;
+            }
+        }
+        return r;
+    }
+    // ssh config alias
+    if let Some(cfg) = load_ssh_config() {
+        let p = cfg.query(spec);
+        if p.host_name.as_deref().is_some_and(|h| !h.is_empty()) {
+            return Resolved {
+                host: p.host_name.unwrap(),
+                port: p.port.unwrap_or(22),
+                user: p.user.unwrap_or_else(|| base.user.clone()),
+                private_key: p
+                    .identity_file
+                    .and_then(|f| f.first().map(|p| p.to_string_lossy().into_owned())),
+                proxy_jump: None,
+            };
+        }
+    }
+    // user@host[:port] / host[:port]
+    let (user, rest) = match spec.split_once('@') {
+        Some((u, h)) => (u.to_string(), h),
+        None => (base.user.clone(), spec),
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+        _ => (rest.to_string(), 22),
+    };
+    Resolved {
+        host,
+        port,
+        user,
+        private_key: base.private_key.clone(),
+        proxy_jump: None,
+    }
+}
+
 /// Connect, authenticate, open a PTY shell, spawn the pump, probe the shell.
 pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Result<Opened> {
     let r = resolve(&params)?;
@@ -285,12 +351,53 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
         port: r.port,
         policy: params.host_key_policy,
     };
-    let mut handle = tokio::time::timeout(
-        params.connect_timeout,
-        russh::client::connect(config, (r.host.as_str(), r.port), handler),
-    )
-    .await
-    .with_context(|| format!("connect to {target} timed out"))??;
+
+    // ProxyJump: connect the bastion, then tunnel the target handshake through
+    // a direct-tcpip channel on it.
+    let (mut handle, bastion) = if let Some(jump) = r.proxy_jump.as_deref() {
+        let jr = resolve_jump(jump, &params);
+        let jtarget = format!("{}@{}:{}", jr.user, jr.host, jr.port);
+        let jhandler = ClientHandler {
+            host: jr.host.clone(),
+            port: jr.port,
+            policy: params.host_key_policy,
+        };
+        let mut bh = tokio::time::timeout(
+            params.connect_timeout,
+            russh::client::connect(config.clone(), (jr.host.as_str(), jr.port), jhandler),
+        )
+        .await
+        .with_context(|| format!("connect to bastion {jtarget} timed out"))??;
+        let bparams = ConnectParams {
+            password: params.password.clone(),
+            private_key: jr.private_key.clone().or(params.private_key.clone()),
+            passphrase: params.passphrase.clone(),
+            use_agent: params.use_agent,
+            ..params.clone()
+        };
+        authenticate(&mut bh, &bparams, &jr)
+            .await
+            .with_context(|| format!("bastion {jtarget} auth failed"))?;
+        let channel = bh
+            .channel_open_direct_tcpip(r.host.clone(), r.port as u32, "127.0.0.1", 0)
+            .await
+            .with_context(|| format!("bastion cannot reach {target}"))?;
+        let h = tokio::time::timeout(
+            params.connect_timeout,
+            russh::client::connect_stream(config, channel.into_stream(), handler),
+        )
+        .await
+        .with_context(|| format!("ssh handshake to {target} via {jtarget} timed out"))??;
+        (h, Some(Box::new(bh)))
+    } else {
+        let h = tokio::time::timeout(
+            params.connect_timeout,
+            russh::client::connect(config, (r.host.as_str(), r.port), handler),
+        )
+        .await
+        .with_context(|| format!("connect to {target} timed out"))??;
+        (h, None)
+    };
 
     let auth_method = authenticate(&mut handle, &params, &r).await?;
 
@@ -324,10 +431,12 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
         id: manager.next_id(),
         target,
         name: params.name.clone(),
+        mode: params.mode.clone(),
         shell_kind: ShellKind::Unknown,
         shared: shared.clone(),
         writer: tokio::sync::Mutex::new(write_half),
         handle,
+        bastion,
         sftp: tokio::sync::Mutex::new(None),
         io_lock: tokio::sync::Mutex::new(()),
         reads: parking_lot::Mutex::new(Default::default()),
@@ -367,6 +476,28 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
                 &b" export HISTCONTROL=\"${HISTCONTROL:+$HISTCONTROL:}ignorespace\"; setopt HIST_IGNORE_SPACE 2>/dev/null\n"[..],
             )
             .await;
+    } else {
+        // Windows-family probes: PowerShell prints a version table, cmd prints
+        // a Windows version banner. ssh_shell is POSIX-only; these sessions
+        // use ssh_exec / ssh_type / ssh_expect.
+        let p2 = shared.inner.lock().stream.end_offset();
+        {
+            let w = session.writer.lock().await;
+            let _ = w.data_bytes(&b"$PSVersionTable.PSVersion\n"[..]).await;
+        }
+        if session::wait_stream_contains(&shared, p2, b"PSVersion", Duration::from_secs(2)).await {
+            session.shell_kind = ShellKind::PowerShell;
+        } else {
+            let p3 = shared.inner.lock().stream.end_offset();
+            {
+                let w = session.writer.lock().await;
+                let _ = w.data_bytes(&b"ver\n"[..]).await;
+            }
+            if session::wait_stream_contains(&shared, p3, b"Windows", Duration::from_secs(2)).await
+            {
+                session.shell_kind = ShellKind::Cmd;
+            }
+        }
     }
 
     Ok(Opened {

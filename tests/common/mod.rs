@@ -62,10 +62,14 @@ pub fn start_container() -> (Container, u16) {
 
 pub fn ssh_open_params(port: u16) -> SshOpenParams {
     SshOpenParams {
-        host: "127.0.0.1".into(),
+        server: None,
+        host: Some("127.0.0.1".into()),
         port: Some(port),
         user: Some("test".into()),
         name: None,
+        proxy_jump: None,
+        mode: None,
+        allow: vec![],
         password: Some("testpass".into()),
         private_key: None,
         passphrase: None,
