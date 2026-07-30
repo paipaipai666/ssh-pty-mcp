@@ -70,7 +70,14 @@ user = "jump"
 
 Then: `ssh_open(server="prod")`. Merge order: explicit params > servers.toml >
 ~/.ssh/config (including its `ProxyJump`). `ssh_list_servers` shows all
-configured servers (no secrets).
+configured servers (no secrets) plus `load_error` when the file exists but
+is unreadable/unparseable (UTF-8 BOM and UTF-16 files are accepted).
+
+`proxy_jump` resolves in order: (1) name/id of an **existing open session**
+(reused as the jump host — no second connection, no extra auth), (2) a
+servers.toml / ~/.ssh/config alias, (3) `user@host[:port]`. So
+`ssh_open(name="bastion", ...)` then `ssh_open(proxy_jump="bastion", ...)`
+chains through the live bastion session.
 
 ## Security modes
 

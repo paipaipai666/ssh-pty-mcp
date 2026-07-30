@@ -1181,6 +1181,51 @@ async fn e2e() {
         .await
         .unwrap();
 
+    // Scenario 37: proxy_jump via an OPEN SESSION alias (no second connection,
+    // no servers.toml entry for the bastion).
+    let jumpbox = mcp
+        .ssh_open(Parameters(SshOpenParams {
+            name: Some("jumpbox".into()),
+            ..ssh_open_params(port)
+        }))
+        .await
+        .expect("37: open jumpbox session");
+    let mut jumped2 = None;
+    let mut last_err2 = String::new();
+    for _ in 0..15 {
+        match mcp
+            .ssh_open(Parameters(SshOpenParams {
+                host: Some(target_ip.clone()),
+                port: Some(22),
+                proxy_jump: Some("jumpbox".into()), // session alias, not a DNS name
+                ..ssh_open_params(port)
+            }))
+            .await
+        {
+            Ok(o) => {
+                jumped2 = Some(o);
+                break;
+            }
+            Err(e) => {
+                last_err2 = e.message.to_string();
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+        }
+    }
+    let jumped2 = jumped2.unwrap_or_else(|| panic!("37: open via session-alias jump: {last_err2}"));
+    let r = run(&mcp, &jumped2.0.session_id, "hostname").await;
+    assert!(
+        r.output.contains(&target_id[..12]),
+        "37: landed on target via session-alias jump, got {:?}",
+        r.output
+    );
+    mcp.ssh_close(Parameters(sid(&jumped2.0.session_id)))
+        .await
+        .unwrap();
+    mcp.ssh_close(Parameters(sid(&jumpbox.0.session_id)))
+        .await
+        .unwrap();
+
     // Scenario 34: readonly mode blocks dangerous commands and mutations.
     let ro = mcp
         .ssh_open(Parameters(SshOpenParams {

@@ -93,8 +93,9 @@ pub struct SshOpenParams {
     /// session_id is accepted.
     #[serde(default)]
     pub name: Option<String>,
-    /// ProxyJump spec: "user@host[:port]", or an alias from
-    /// servers.toml / ~/.ssh/config.
+    /// ProxyJump spec: the name/id of an existing open session (reused as
+    /// the jump host, no second connection), an alias from
+    /// servers.toml / ~/.ssh/config, or "user@host[:port]".
     #[serde(default)]
     pub proxy_jump: Option<String>,
     /// Command policy: "unrestricted" (default), "readonly" (mutating tools
@@ -164,6 +165,9 @@ pub struct ListEntry {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ListServersOut {
     pub servers: Vec<crate::servers::ServerSummary>,
+    /// Why servers.toml contributed nothing (parse error, unreadable file).
+    /// null when the registry loaded cleanly or simply doesn't exist.
+    pub load_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -652,12 +656,20 @@ impl SshMcp {
         // Merge order: explicit params > servers.toml > ~/.ssh/config.
         let entry = match p.server.as_deref() {
             Some(name) => {
-                let e = crate::servers::load().servers.remove(name);
+                let (mut file, problem) = crate::servers::load_verbose();
+                let e = file.servers.remove(name);
                 match e {
                     Some(e) => Some(e),
                     None => {
+                        let detail = match problem {
+                            Some(p) => format!(" (registry broken: {p})"),
+                            None if !crate::servers::servers_path().exists() => {
+                                " (file does not exist)".to_string()
+                            }
+                            None => String::new(),
+                        };
                         return Err(invalid(format!(
-                            "server '{name}' not found in {}; call ssh_list_servers",
+                            "server '{name}' not found in {}{detail}; call ssh_list_servers",
                             crate::servers::servers_path().display()
                         )));
                     }
@@ -796,6 +808,7 @@ impl SshMcp {
     pub async fn ssh_list_servers(&self) -> Result<Json<ListServersOut>, McpError> {
         Ok(Json(ListServersOut {
             servers: crate::servers::list_summaries(),
+            load_error: crate::servers::load_verbose().1,
         }))
     }
 

@@ -131,6 +131,13 @@ impl Shared {
     }
 }
 
+pub enum Bastion {
+    /// A dedicated connection opened solely as this session's jump host.
+    Owned(Box<russh::client::Handle<crate::connect::ClientHandler>>),
+    /// An existing open session reused as the jump host (proxy_jump by name).
+    Shared(Arc<Session>),
+}
+
 pub struct Session {
     pub id: String,
     pub target: String,       // "user@host:port"
@@ -141,7 +148,7 @@ pub struct Session {
     pub writer: tokio::sync::Mutex<russh::ChannelWriteHalf<russh::client::Msg>>,
     pub handle: russh::client::Handle<crate::connect::ClientHandler>,
     /// Bastion connection, kept alive for the session's lifetime (ProxyJump).
-    pub bastion: Option<Box<russh::client::Handle<crate::connect::ClientHandler>>>,
+    pub bastion: Option<Bastion>,
     pub sftp: tokio::sync::Mutex<Option<russh_sftp::client::SftpSession>>,
     pub io_lock: tokio::sync::Mutex<()>,
     pub reads: Mutex<HashMap<String, ReadCoverage>>,

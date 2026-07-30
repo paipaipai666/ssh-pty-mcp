@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "ssh-pty-mcp"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "chrono",

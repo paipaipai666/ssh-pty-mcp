@@ -352,32 +352,57 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
         policy: params.host_key_policy,
     };
 
-    // ProxyJump: connect the bastion, then tunnel the target handshake through
-    // a direct-tcpip channel on it.
+    // ProxyJump: tunnel the target handshake through a direct-tcpip channel
+    // on the bastion. The jump spec may name an existing open session (by
+    // name or id), a servers.toml / ~/.ssh/config alias, or user@host[:port].
     let (mut handle, bastion) = if let Some(jump) = r.proxy_jump.as_deref() {
-        let jr = resolve_jump(jump, &params);
-        let jtarget = format!("{}@{}:{}", jr.user, jr.host, jr.port);
-        let jhandler = ClientHandler {
-            host: jr.host.clone(),
-            port: jr.port,
-            policy: params.host_key_policy,
-        };
-        let mut bh = tokio::time::timeout(
-            params.connect_timeout,
-            russh::client::connect(config.clone(), (jr.host.as_str(), jr.port), jhandler),
-        )
-        .await
-        .with_context(|| format!("connect to bastion {jtarget} timed out"))??;
-        let bparams = ConnectParams {
-            password: params.password.clone(),
-            private_key: jr.private_key.clone().or(params.private_key.clone()),
-            passphrase: params.passphrase.clone(),
-            use_agent: params.use_agent,
-            ..params.clone()
-        };
-        authenticate(&mut bh, &bparams, &jr)
+        let mut via_session = None;
+        for s in manager.list().await {
+            if (s.name.as_deref() == Some(jump) || s.id == jump)
+                && s.alive.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                via_session = Some(s);
+                break;
+            }
+        }
+        // russh Handles aren't Clone, so hold the bastion as an enum and
+        // borrow the handle out for the direct-tcpip channel.
+        enum JumpHost {
+            Session(std::sync::Arc<crate::session::Session>),
+            Owned(russh::client::Handle<ClientHandler>),
+        }
+        let jump_host = if let Some(bs) = via_session {
+            JumpHost::Session(bs)
+        } else {
+            let jr = resolve_jump(jump, &params);
+            let jtarget = format!("{}@{}:{}", jr.user, jr.host, jr.port);
+            let jhandler = ClientHandler {
+                host: jr.host.clone(),
+                port: jr.port,
+                policy: params.host_key_policy,
+            };
+            let mut bh = tokio::time::timeout(
+                params.connect_timeout,
+                russh::client::connect(config.clone(), (jr.host.as_str(), jr.port), jhandler),
+            )
             .await
-            .with_context(|| format!("bastion {jtarget} auth failed"))?;
+            .with_context(|| format!("connect to bastion {jtarget} timed out"))??;
+            let bparams = ConnectParams {
+                password: params.password.clone(),
+                private_key: jr.private_key.clone().or(params.private_key.clone()),
+                passphrase: params.passphrase.clone(),
+                use_agent: params.use_agent,
+                ..params.clone()
+            };
+            authenticate(&mut bh, &bparams, &jr)
+                .await
+                .with_context(|| format!("bastion {jtarget} auth failed"))?;
+            JumpHost::Owned(bh)
+        };
+        let bh = match &jump_host {
+            JumpHost::Session(s) => &s.handle,
+            JumpHost::Owned(h) => h,
+        };
         let channel = bh
             .channel_open_direct_tcpip(r.host.clone(), r.port as u32, "127.0.0.1", 0)
             .await
@@ -387,8 +412,12 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
             russh::client::connect_stream(config, channel.into_stream(), handler),
         )
         .await
-        .with_context(|| format!("ssh handshake to {target} via {jtarget} timed out"))??;
-        (h, Some(Box::new(bh)))
+        .with_context(|| format!("ssh handshake to {target} via bastion timed out"))??;
+        let keep = match jump_host {
+            JumpHost::Session(s) => crate::session::Bastion::Shared(s),
+            JumpHost::Owned(h) => crate::session::Bastion::Owned(Box::new(h)),
+        };
+        (h, Some(keep))
     } else {
         let h = tokio::time::timeout(
             params.connect_timeout,
