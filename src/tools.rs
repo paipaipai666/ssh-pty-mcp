@@ -669,7 +669,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Run a command in the persistent shell and return clean output + exit code. Persistent shell: cwd/env/aliases survive across calls. For system monitoring prefer batch commands (top -b -n 1, ps aux --sort=-%cpu | head) over interactive TUIs. PRECONDITION: the shell must be at a prompt — if you used ssh_type/ssh_press to start a long-running or interactive command (vi, passwd, ssh...), first confirm it finished via ssh_expect/ssh_screen, otherwise a scaffolding line may be typed into the foreground program. On timeout returns partial output with timed_out=true (the command keeps running)."
+        description = "Run a command in the persistent shell and return clean output + exit code. Persistent shell: cwd/env/aliases survive across calls; `exit`/`logout` KILLS the whole session (open a new one). For system monitoring prefer batch commands (top -b -n 1, ps aux --sort=-%cpu | head) over interactive TUIs. PRECONDITION: the shell must be at a prompt — if you used ssh_type/ssh_press to start a long-running or interactive command (vi, passwd, ssh...), first confirm it finished via ssh_expect/ssh_screen, or use ssh_exec instead (stateless, never queues behind the shell). On timeout returns partial output with timed_out=true (the command keeps running)."
     )]
     pub async fn ssh_shell(
         &self,
@@ -1151,6 +1151,11 @@ impl SshMcp {
         let path_lock = session.write_lock_for(&real);
         let _wg = path_lock.lock().await;
         if overwrite && let Ok(meta) = sftp.metadata(&real).await {
+            if meta.is_dir() {
+                return Err(invalid(format!(
+                    "{real} is a directory; specify a full file path"
+                )));
+            }
             let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
             if fp.0 > 0 {
                 guard_check(&session, &real, fp, "file_write")?;
@@ -1202,6 +1207,11 @@ impl SshMcp {
         let path_lock = session.write_lock_for(&real);
         let _wg = path_lock.lock().await;
         if let Ok(meta) = sftp.metadata(&real).await {
+            if meta.is_dir() {
+                return Err(invalid(format!(
+                    "{real} is a directory; specify a full file path"
+                )));
+            }
             let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
             if fp.0 > 0 {
                 guard_check(&session, &real, fp, "ssh_upload")?;
@@ -1360,7 +1370,7 @@ impl SshMcp {
     }
 
     #[tool(
-        description = "Start a command in the persistent shell without blocking; returns task_id. Poll with ssh_task_status (optionally with wait_ms). Same semantics as ssh_shell (state persists, at-prompt precondition); the task holds the shell until done, so avoid other ssh_shell calls in the meantime (ssh_exec, ssh_screen, ssh_expect, file tools remain usable)."
+        description = "Start a command in the persistent shell without blocking; returns task_id. Poll with ssh_task_status (optionally with wait_ms), interrupt with ssh_task_cancel. Same semantics as ssh_shell (state persists, at-prompt precondition; `exit` in the command KILLS the whole session, not just the task); the task holds the shell until done, so avoid other ssh_shell calls in the meantime (ssh_exec, ssh_screen, ssh_expect, file tools remain usable)."
     )]
     pub async fn ssh_shell_async(
         &self,
@@ -1508,9 +1518,19 @@ impl SshMcp {
                 .canonicalize(&p.to_path)
                 .await
                 .unwrap_or_else(|_| p.to_path.clone());
+            if real_from == real_to {
+                return Err(invalid(format!(
+                    "{real_from} and {real_to} are the same file; refusing to copy"
+                )));
+            }
             let path_lock = to.write_lock_for(&real_to);
             let _wg = path_lock.lock().await;
             if let Ok(meta) = s.metadata(&real_to).await {
+                if meta.is_dir() {
+                    return Err(invalid(format!(
+                        "{real_to} is a directory; specify a full file path"
+                    )));
+                }
                 let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
                 if fp.0 > 0 {
                     guard_check(&to, &real_to, fp, "ssh_copy")?;
@@ -1551,9 +1571,21 @@ impl SshMcp {
             .canonicalize(&p.to_path)
             .await
             .unwrap_or_else(|_| p.to_path.clone());
+        // Same host (identical target) + same canonical path = same inode:
+        // truncating the destination would destroy the source.
+        if from.target == to.target && real_from == real_to {
+            return Err(invalid(format!(
+                "{real_from} and {real_to} are the same file; refusing to copy"
+            )));
+        }
         let path_lock = to.write_lock_for(&real_to);
         let _wg = path_lock.lock().await;
         if let Ok(meta) = sftp_to.metadata(&real_to).await {
+            if meta.is_dir() {
+                return Err(invalid(format!(
+                    "{real_to} is a directory; specify a full file path"
+                )));
+            }
             let fp: Fingerprint = (meta.size.unwrap_or(0), meta.mtime.unwrap_or(0));
             if fp.0 > 0 {
                 guard_check(&to, &real_to, fp, "ssh_copy")?;

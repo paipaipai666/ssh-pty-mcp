@@ -937,6 +937,82 @@ async fn e2e() {
     );
     assert_eq!(x.exit_code, Some(0));
 
+    // Scenario 27: ssh_copy self-copy is refused without data loss.
+    mcp.file_write(Parameters(FileWriteParams {
+        session_id: id.clone(),
+        path: "/tmp/important.txt".into(),
+        content: "important data".into(),
+        mode: "overwrite".into(),
+    }))
+    .await
+    .expect("27: seed");
+    let err = mcp
+        .ssh_copy(Parameters(SshCopyParams {
+            from_session: id.clone(),
+            from_path: "/tmp/important.txt".into(),
+            to_session: id.clone(),
+            to_path: "/tmp/important.txt".into(),
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("same file"),
+        "27: self-copy refused, got {err}"
+    );
+    let r = mcp
+        .file_read(Parameters(FileReadParams {
+            session_id: id.clone(),
+            path: "/tmp/important.txt".into(),
+            offset: 0,
+            limit: 262144,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(r.content, "important data", "27: source intact");
+
+    // Scenario 28: directory destinations get a clear error.
+    let err = mcp
+        .ssh_upload(Parameters(TransferParams {
+            session_id: id.clone(),
+            local_path: local.to_string_lossy().into_owned(),
+            remote_path: "/tmp/".into(),
+        }))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.message.contains("directory"),
+        "28: directory named, got {err}"
+    );
+
+    // Scenario 29: ssh_screen filters scaffolding from the presentation.
+    run(&mcp, &id, "echo CLEAN_SCREEN").await;
+    let s = mcp
+        .ssh_screen(Parameters(SshScreenParams {
+            session_id: id.clone(),
+            since_seq: None,
+            wait: "none".into(),
+            settle_ms: 250,
+            timeout_ms: 5000,
+            tail_lines: None,
+        }))
+        .await
+        .unwrap()
+        .0;
+    assert!(
+        !s.screen.contains("__SPM_"),
+        "29: no marker lines, got:\n{}",
+        s.screen
+    );
+    assert!(
+        !s.screen.contains("stty -echo"),
+        "29: no stty lines, got:\n{}",
+        s.screen
+    );
+    assert!(s.screen.contains("CLEAN_SCREEN"), "29: real output kept");
+
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(
         SessionManager::default(),

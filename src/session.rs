@@ -187,8 +187,23 @@ pub enum WaitMode {
 }
 
 /// Render the current screen: viewport text, trailing blank lines trimmed.
+/// Scaffolding lines (our markers, stty/PS1 wrappers) are filtered at the
+/// presentation layer — the vt100 model keeps everything; agents see a clean
+/// terminal.
 pub fn screen_text(parser: &vt100::Parser) -> String {
-    parser.screen().contents().trim_end().to_string()
+    parser
+        .screen()
+        .contents()
+        .lines()
+        .filter(|l| !is_scaffold_line(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string()
+}
+
+fn is_scaffold_line(l: &str) -> bool {
+    l.contains("__SPM_") || l.contains("__spm_ps1=") || l.contains("export HISTCONTROL=")
 }
 
 /// Wait on the screen model. Returns `(screen, seq, idle_ms, timed_out)`.
