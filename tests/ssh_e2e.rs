@@ -1267,6 +1267,92 @@ async fn e2e() {
     );
     mcp.ssh_close(Parameters(sid(&rsid))).await.unwrap();
 
+    // Scenario 36: Windows-family shell (PowerShell) — probe detects it,
+    // ssh_shell refuses with guidance, ssh_exec works natively.
+    let built_win = Command::new("docker")
+        .args([
+            "build",
+            "-q",
+            "-t",
+            "spm-e2e-win",
+            "-f",
+            "tests/docker/Dockerfile.win",
+            "tests/docker",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let win_image = built_win
+        || Command::new("docker")
+            .args(["image", "inspect", "spm-e2e-win"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    if win_image {
+        let wid = run_docker(&["run", "-d", "--rm", "-P", "spm-e2e-win"]);
+        let _wg = TargetGuard(wid.clone());
+        let wport_line = run_docker(&["port", &wid, "22/tcp"]);
+        let wport: u16 = wport_line.rsplit(':').next().unwrap().parse().unwrap();
+        let mut wopen = None;
+        for _ in 0..20 {
+            match mcp
+                .ssh_open(Parameters(common::ssh_open_params(wport)))
+                .await
+            {
+                Ok(o) => {
+                    wopen = Some(o.0);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(700)).await,
+            }
+        }
+        let w = wopen.expect("36: open powershell session");
+        assert_eq!(
+            w.shell_kind,
+            ShellKind::PowerShell,
+            "36: probe detects PowerShell"
+        );
+        let err = mcp
+            .ssh_shell(Parameters(SshShellParams {
+                session_id: w.session_id.clone(),
+                command: "Get-Location".into(),
+                timeout_ms: 10000,
+                max_output_bytes: 65536,
+                strip_ansi: true,
+            }))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            err.message.contains("ssh_exec"),
+            "36: refusal points to ssh_exec, got {err}"
+        );
+        let x = mcp
+            .ssh_exec(Parameters(SshExecParams {
+                session_id: w.session_id.clone(),
+                command: "Write-Output 'hi from pwsh'; (Get-Location).Path".into(),
+                timeout_ms: 15000,
+                max_output_bytes: 65536,
+                strip_ansi: true,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            x.stdout.contains("hi from pwsh"),
+            "36: exec on pwsh, got {:?}",
+            x.stdout
+        );
+        assert!(
+            x.stdout.contains("/home/test"),
+            "36: pwsh cwd, got {:?}",
+            x.stdout
+        );
+        mcp.ssh_close(Parameters(sid(&w.session_id))).await.unwrap();
+    } else {
+        eprintln!("scenario 36: spm-e2e-win image unavailable, skipping");
+    }
+
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(
         SessionManager::default(),

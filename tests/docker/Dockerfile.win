@@ -1,0 +1,6 @@
+FROM spm-e2e
+
+# PowerShell Core as the login shell: exercises the non-POSIX probe path and
+# the ssh_exec route for Windows-family shells, without a Windows container.
+RUN apk add --no-cache powershell \
+ && sed -i 's|:/bin/bash$|:/usr/bin/pwsh|' /etc/passwd

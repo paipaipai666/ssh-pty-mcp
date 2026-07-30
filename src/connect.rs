@@ -446,22 +446,56 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
         pump,
     };
 
-    // POSIX probe: does the shell understand printf?
+    // Shell probes. Order matters:
+    //   1. POSIX printf probe (\n; %s indirection defeats echo matching)
+    //   2. pwsh-exclusive probe with \r — PSReadLine only submits on CR and
+    //      can take ~20s to initialize on musl; POSIX shells syntax-error on
+    //      `('a' + 'b')`, cmd echoes quotes intact (needle can't match)
+    //   3. cmd `ver`
     let start = shared.inner.lock().stream.end_offset();
     {
         let w = session.writer.lock().await;
-        let _ = w
-            .data_bytes(&b"printf '__SPM_PROBE_%s__\\n' ok\n"[..])
-            .await;
+        let _ = w.data_bytes(&b"printf '__SPM_PROBE_%s__\n' ok\n"[..]).await;
     }
-    if session::wait_stream_contains(&shared, start, b"__SPM_PROBE_ok__", Duration::from_secs(3))
-        .await
+    let kind = if session::wait_stream_contains(
+        &shared,
+        start,
+        b"__SPM_PROBE_ok__",
+        Duration::from_secs(3),
+    )
+    .await
     {
+        ShellKind::Posix
+    } else {
+        let p2 = shared.inner.lock().stream.end_offset();
+        {
+            let w = session.writer.lock().await;
+            let _ = w.data_bytes(&b"echo ('__SPM_PROBE2_' + 'ok')\r"[..]).await;
+        }
+        if session::wait_stream_contains(&shared, p2, b"__SPM_PROBE2_ok__", Duration::from_secs(20))
+            .await
+        {
+            ShellKind::PowerShell
+        } else {
+            let p3 = shared.inner.lock().stream.end_offset();
+            {
+                let w = session.writer.lock().await;
+                let _ = w.data_bytes(&b"ver\r"[..]).await;
+            }
+            if session::wait_stream_contains(&shared, p3, b"Windows", Duration::from_secs(3)).await
+            {
+                ShellKind::Cmd
+            } else {
+                ShellKind::Unknown
+            }
+        }
+    };
+    session.shell_kind = kind;
+    if kind == ShellKind::Posix {
         // Echo stays ON between commands: readline needs the tty ECHO flag to
         // display input and history recall (persistent stty -echo breaks
         // up-arrow and interactive editing). ssh_run toggles echo off around
         // each command instead (PRE handshake in tools.rs).
-        session.shell_kind = ShellKind::Posix;
         // bash/zsh readline advertise bracketed paste via \x1b[?2004h in the
         // prompt redraw — enables paste-wrapped command delivery in ssh_run.
         let (bytes, _, _) = shared.inner.lock().stream.read(start);
@@ -476,28 +510,6 @@ pub async fn open(params: ConnectParams, manager: &SessionManager) -> anyhow::Re
                 &b" export HISTCONTROL=\"${HISTCONTROL:+$HISTCONTROL:}ignorespace\"; setopt HIST_IGNORE_SPACE 2>/dev/null\n"[..],
             )
             .await;
-    } else {
-        // Windows-family probes: PowerShell prints a version table, cmd prints
-        // a Windows version banner. ssh_shell is POSIX-only; these sessions
-        // use ssh_exec / ssh_type / ssh_expect.
-        let p2 = shared.inner.lock().stream.end_offset();
-        {
-            let w = session.writer.lock().await;
-            let _ = w.data_bytes(&b"$PSVersionTable.PSVersion\n"[..]).await;
-        }
-        if session::wait_stream_contains(&shared, p2, b"PSVersion", Duration::from_secs(2)).await {
-            session.shell_kind = ShellKind::PowerShell;
-        } else {
-            let p3 = shared.inner.lock().stream.end_offset();
-            {
-                let w = session.writer.lock().await;
-                let _ = w.data_bytes(&b"ver\n"[..]).await;
-            }
-            if session::wait_stream_contains(&shared, p3, b"Windows", Duration::from_secs(2)).await
-            {
-                session.shell_kind = ShellKind::Cmd;
-            }
-        }
     }
 
     Ok(Opened {
