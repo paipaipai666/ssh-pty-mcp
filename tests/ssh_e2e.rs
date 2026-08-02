@@ -1226,6 +1226,108 @@ async fn e2e() {
         .await
         .unwrap();
 
+    // Scenario 38: host-key change is REFUSED under accept-new (MITM guard);
+    // host_key_policy="off" still opens, proving the server itself is fine.
+    {
+        let (ca, pa) = start_container();
+        let learn = mcp
+            .ssh_open(Parameters(SshOpenParams {
+                host_key_policy: "accept-new".into(),
+                ..ssh_open_params(pa)
+            }))
+            .await
+            .expect("38: learn sandbox key");
+        mcp.ssh_close(Parameters(sid(&learn.0.session_id)))
+            .await
+            .unwrap();
+        drop(ca); // remove container A (image-built keys)
+        // Container B on the SAME host port with freshly generated keys.
+        // Port release after rm -f can lag; retry the bind.
+        let pbind = format!("127.0.0.1:{pa}:22");
+        let mut b = None;
+        for _ in 0..20 {
+            let out = Command::new("docker")
+                .args([
+                    "run", "-d", "--rm", "-p", &pbind, "--entrypoint", "sh", "spm-e2e", "-c",
+                    "rm -f /etc/ssh/ssh_host_*; ssh-keygen -A >/dev/null; exec /usr/sbin/sshd -D -e",
+                ])
+                .output()
+                .expect("spawn docker");
+            if out.status.success() {
+                b = Some(String::from_utf8(out.stdout).unwrap().trim().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let b = b.expect("38: start fresh-key container");
+        let _bg = TargetGuard(b.clone());
+        let mut refused = None;
+        for _ in 0..20 {
+            match mcp
+                .ssh_open(Parameters(SshOpenParams {
+                    host_key_policy: "accept-new".into(),
+                    ..ssh_open_params(pa)
+                }))
+                .await
+            {
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+                Ok(o) => {
+                    // Booting race: this opened the OLD container? Not possible
+                    // (A is removed); a successful open means sshd is up —
+                    // retry to observe the key mismatch.
+                    mcp.ssh_close(Parameters(sid(&o.0.session_id)))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+            }
+        }
+        let refused = refused.expect("38: changed key must be refused");
+        assert!(!refused.message.is_empty(), "38: refusal carries a message");
+        eprintln!("38: refusal message: {:?}", refused.message);
+        // The abrupt key-refusal teardown can briefly hit sshd MaxStartups;
+        // give the server a beat, then retry.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let mut off = None;
+        for _ in 0..10 {
+            match mcp
+                .ssh_open(Parameters(SshOpenParams {
+                    host_key_policy: "off".into(),
+                    ..ssh_open_params(pa)
+                }))
+                .await
+            {
+                Ok(o) => {
+                    off = Some(o);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("38: off retry: {e}");
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                }
+            }
+        }
+        let off = off.expect("38: off policy still opens after key change");
+        mcp.ssh_close(Parameters(sid(&off.0.session_id)))
+            .await
+            .unwrap();
+        // Clean the learned entry (random host port) from ~/.ssh/known_hosts.
+        let kh = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join(".ssh/known_hosts"));
+        if let Some(kh) = kh
+            && let Ok(text) = std::fs::read_to_string(&kh)
+        {
+            let needle = format!("[127.0.0.1]:{pa}");
+            let kept: Vec<&str> = text.lines().filter(|l| !l.contains(&needle)).collect();
+            let _ = std::fs::write(&kh, kept.join("\n"));
+        }
+    }
+
     // Scenario 34: readonly mode blocks dangerous commands and mutations.
     let ro = mcp
         .ssh_open(Parameters(SshOpenParams {
@@ -1393,10 +1495,78 @@ async fn e2e() {
             "36: pwsh cwd, got {:?}",
             x.stdout
         );
+        // 36b: ssh_shell_async refuses upfront — no phantom task_id that
+        // only errors on status poll.
+        let aerr = mcp
+            .ssh_shell_async(Parameters(SshShellAsyncParams {
+                session_id: w.session_id.clone(),
+                command: "Get-Date".into(),
+                timeout_ms: 10000,
+                max_output_bytes: 65536,
+                strip_ansi: true,
+            }))
+            .await
+            .err()
+            .expect("36b: async refusal");
+        assert!(
+            aerr.message.contains("ssh_exec"),
+            "36b: async refusal points to ssh_exec, got {aerr}"
+        );
+        // 36c: ssh_ready works on PowerShell (CR probe, not POSIX printf).
+        let rdy = mcp
+            .ssh_ready(Parameters(SshReadyParams {
+                session_id: w.session_id.clone(),
+                probe_timeout_ms: 45000,
+            }))
+            .await
+            .unwrap()
+            .0;
+        assert!(rdy.ready, "36c: ssh_ready true on PowerShell");
         mcp.ssh_close(Parameters(sid(&w.session_id))).await.unwrap();
     } else {
         eprintln!("scenario 36: spm-e2e-win image unavailable, skipping");
     }
+
+    // Scenario 39: ssh_add_server writes a usable registry entry (the tool
+    // replaces hand-editing — which caused the original encoding bug).
+    let added_params = || SshAddServerParams {
+        name: "added".into(),
+        host: "127.0.0.1".into(),
+        port: Some(port),
+        user: Some("test".into()),
+        password: Some("testpass".into()),
+        private_key: None,
+        passphrase: None,
+        proxy_jump: None,
+        mode: None,
+        allow: vec![],
+        overwrite: false,
+    };
+    let add = mcp
+        .ssh_add_server(Parameters(added_params()))
+        .await
+        .expect("39: add server")
+        .0;
+    assert!(!add.overwritten);
+    let dup = mcp
+        .ssh_add_server(Parameters(added_params()))
+        .await
+        .err()
+        .expect("39: duplicate add must error");
+    assert!(
+        dup.message.contains("already exists"),
+        "39: duplicate error, got {dup}"
+    );
+    let o = mcp
+        .ssh_open(Parameters(SshOpenParams {
+            server: Some("added".into()),
+            ..ssh_open_params(port)
+        }))
+        .await
+        .expect("39: open via added server");
+    mcp.ssh_close(Parameters(sid(&o.0.session_id)))
+        .await
+        .unwrap();
 
     // Scenario 16: session limit is enforced.
     let limited = SshMcp::new(

@@ -82,6 +82,8 @@ impl SessionMode {
 pub struct Shared {
     pub inner: Mutex<ScreenState>,
     pub notify: tokio::sync::Notify,
+    /// Terminal-query responses (DSR/DA answers) for the response-writer task.
+    responses: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 }
 
 pub struct ScreenState {
@@ -93,17 +95,27 @@ pub struct ScreenState {
 }
 
 impl Shared {
-    pub fn new(rows: u16, cols: u16) -> Self {
-        Self {
-            inner: Mutex::new(ScreenState {
-                parser: vt100::Parser::new(rows, cols, 0),
-                stream: RingBuf::default(),
-                seq: 0,
-                last_output_at: Instant::now(),
-                eof: false,
-            }),
-            notify: tokio::sync::Notify::new(),
-        }
+    pub fn new(rows: u16, cols: u16) -> (Self, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+        let (responses, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                inner: Mutex::new(ScreenState {
+                    parser: vt100::Parser::new(rows, cols, 0),
+                    stream: RingBuf::default(),
+                    seq: 0,
+                    last_output_at: Instant::now(),
+                    eof: false,
+                }),
+                notify: tokio::sync::Notify::new(),
+                responses,
+            },
+            rx,
+        )
+    }
+
+    /// Queue a byte string for the session writer (e.g. terminal replies).
+    pub fn enqueue_response(&self, bytes: Vec<u8>) {
+        let _ = self.responses.send(bytes);
     }
 
     /// Pump-side ingest: one call per received byte batch.
@@ -145,10 +157,11 @@ pub struct Session {
     pub mode: SessionMode,
     pub shell_kind: ShellKind,
     pub shared: Arc<Shared>,
-    pub writer: tokio::sync::Mutex<russh::ChannelWriteHalf<russh::client::Msg>>,
+    pub writer: Arc<tokio::sync::Mutex<russh::ChannelWriteHalf<russh::client::Msg>>>,
     pub handle: russh::client::Handle<crate::connect::ClientHandler>,
-    /// Bastion connection, kept alive for the session's lifetime (ProxyJump).
-    pub bastion: Option<Bastion>,
+    /// Bastion connections, kept alive for the session's lifetime
+    /// (ProxyJump chain: one entry per hop, plus the final bastion).
+    pub bastion: Vec<Bastion>,
     pub sftp: tokio::sync::Mutex<Option<russh_sftp::client::SftpSession>>,
     pub io_lock: tokio::sync::Mutex<()>,
     pub reads: Mutex<HashMap<String, ReadCoverage>>,
@@ -235,7 +248,14 @@ pub fn spawn_pump(
     tokio::spawn(async move {
         loop {
             match read.wait().await {
-                Some(ChannelMsg::Data { data }) => shared.feed(&data),
+                Some(ChannelMsg::Data { data }) => {
+                    // Answer terminal queries (DSR/DA) so readline/PSReadLine
+                    // don't hang waiting for a real terminal's reply.
+                    if let Some(reply) = terminal_reply(&data) {
+                        shared.enqueue_response(reply);
+                    }
+                    shared.feed(&data);
+                }
                 Some(ChannelMsg::ExtendedData { data, ext: 1 }) => shared.feed(&data),
                 Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
                 _ => {} // ChannelMsg is #[non_exhaustive]
@@ -244,6 +264,54 @@ pub fn spawn_pump(
         alive.store(false, Ordering::SeqCst);
         shared.mark_eof();
     })
+}
+
+/// Detect terminal query sequences in a remote->local byte batch and build
+/// the reply a real terminal would send:
+///   \x1b[6n      DSR (cursor position) -> \x1b[1;1R
+///   \x1b[?6n     DECXCPR             -> \x1b[?1;1R
+///   \x1b[c       DA1 (device attrs)  -> \x1b[?62c  (VT220)
+///   \x1b[?1;2c  DA2                  -> \x1b[?62;1;2;6;9;15;22c
+/// Unknown-queries are ignored (a wrong reply is worse than silence).
+fn terminal_reply(data: &[u8]) -> Option<Vec<u8>> {
+    let esc = data.windows(2).any(|w| w == b"\x1b[") || data.windows(2).any(|w| w == b"\x1b?");
+    if !esc {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'[' {
+            let mut j = i + 2;
+            let mut q = false;
+            if j < data.len() && data[j] == b'?' {
+                q = true;
+                j += 1;
+            }
+            // Parameter/intermediate bytes then final byte in @..~.
+            let start = j;
+            while j < data.len() && (0x30..=0x3f).contains(&data[j]) {
+                j += 1;
+            }
+            let final_byte = if j < data.len() { data[j] } else { 0 };
+            if (0x40..=0x7e).contains(&final_byte) {
+                let params = &data[start..j];
+                match (q, final_byte) {
+                    (false, b'n') if params == b"6" => out.extend_from_slice(b"\x1b[1;1R"),
+                    (true, b'n') if params == b"6" => out.extend_from_slice(b"\x1b[?1;1R"),
+                    (false, b'c') if params.is_empty() => out.extend_from_slice(b"\x1b[?62c"),
+                    (true, b'c') if params == b"1;2" => {
+                        out.extend_from_slice(b"\x1b[?62;1;2;6;9;15;22c")
+                    }
+                    _ => {}
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 // ── Wait-state machine ──────────────────────────────────────────────────────
@@ -503,7 +571,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wait_machine_modes() {
-        let s2 = Arc::new(Shared::new(24, 80));
+        let (s0, _rx) = Shared::new(24, 80);
+        let s2 = Arc::new(s0);
         let s3 = s2.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;

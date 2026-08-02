@@ -35,6 +35,7 @@ cargo install ssh-pty-mcp
 | Tool | Purpose |
 |---|---|
 | `ssh_open` / `ssh_close` / `ssh_list` | Session lifecycle (key / SSH-agent / password auth, `~/.ssh/config` resolution, known_hosts accept-new, optional session alias) |
+| `ssh_add_server` / `ssh_list_servers` | Add/replace entries in `servers.toml` (validated, preserves other content) and list the registry |
 | `ssh_shell` | Run a command in the persistent shell; returns clean output + exit code |
 | `ssh_shell_async` / `ssh_task_status` / `ssh_task_cancel` | Background a persistent-shell command; poll or cancel it |
 | `ssh_exec` | One-shot stateless exec channel (protocol exit status, split stdout/stderr, isolated from the shell; safest path for multi-line/heredoc) |
@@ -75,9 +76,10 @@ is unreadable/unparseable (UTF-8 BOM and UTF-16 files are accepted).
 
 `proxy_jump` resolves in order: (1) name/id of an **existing open session**
 (reused as the jump host — no second connection, no extra auth), (2) a
-servers.toml / ~/.ssh/config alias, (3) `user@host[:port]`. So
-`ssh_open(name="bastion", ...)` then `ssh_open(proxy_jump="bastion", ...)`
-chains through the live bastion session.
+servers.toml / ~/.ssh/config alias, (3) `user@host[:port]`. Comma-separated
+chains (`"bastion,jump2"`) tunnel through multiple hops; every hop may be a
+session alias. So `ssh_open(name="bastion", ...)` then
+`ssh_open(proxy_jump="bastion", ...)` chains through the live bastion session.
 
 ## Security modes
 
@@ -95,6 +97,32 @@ Per session, at `ssh_open`:
 Sessions probing as `cmd`/`powershell` get a precise error pointing to
 `ssh_exec` — which works on Windows targets today (runs via `cmd /c`,
 no readline involved): multi-line commands, clean output, protocol exit code.
+`ssh_ready` is shell-aware (printf probe on POSIX, PSReadLine CR probe on
+PowerShell, `ver` on cmd), so readiness checks work on Windows too.
+
+## Known limitations
+
+- **ssh_exec timeout leaks the remote process.** OpenSSH does not deliver
+  signals over exec channels; when a command times out the process keeps
+  running on the remote side. Clean up with a follow-up
+  `pkill -f '<pattern>'` via `ssh_exec`.
+- **No relay mode.** The target must be reachable from this machine
+  (direct or via `proxy_jump` chains — multi-hop `"a,b,c"` is supported;
+  each hop may be a session alias). Targets behind strict egress firewalls
+  with no inbound path cannot be reached; a WebSocket relay is not implemented.
+- **ssh_type has no exit code.** Interactive keystrokes don't map to a
+  process exit status; judge success by the output via `ssh_expect`.
+- **ssh_shell_async has no push notification.** MCP has no server-initiated
+  events; poll `ssh_task_status`. The task holds the shell — don't issue
+  other `ssh_shell` calls until it completes.
+- **servers.toml stores passwords in plaintext** (`chmod 600` is applied
+  automatically on Unix; keep the file out of git). Prefer `private_key`.
+- **Scaffolding lines stay in the raw stream.** `ssh_shell`'s internal
+  markers are filtered from `ssh_screen`/`ssh_expect` screen views but
+  remain in the raw byte stream.
+- **True Windows CRLF + cmd only tested logically.** The PowerShell sandbox
+  (alpine + pwsh, `tests/docker/Dockerfile.win`) validates the non-POSIX
+  path on LF line endings; real Windows Server hosts are not CI-covered.
 
 ## Local sandbox + WAN simulation
 

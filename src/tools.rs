@@ -170,6 +170,44 @@ pub struct ListServersOut {
     pub load_error: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SshAddServerParams {
+    /// Registry name, usable as ssh_open(server="name") and as a
+    /// proxy_jump hop. Must not be empty or contain whitespace/[ ] " = #.
+    pub name: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Stored in plaintext — prefer private_key. File gets chmod 600 on Unix
+    /// when a password is present.
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub private_key: Option<String>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+    /// "unrestricted" (default), "readonly", or "restricted".
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Allowlist regexes, used when mode="restricted".
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Replace an existing entry with the same name instead of erroring.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AddServerOut {
+    pub name: String,
+    pub path: String,
+    pub overwritten: bool,
+}
+
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ListOut {
     pub sessions: Vec<ListEntry>,
@@ -634,15 +672,19 @@ impl SshMcp {
                 self.max_sessions
             )));
         }
-        if let Some(name) = p.name.as_deref()
-            && self
+        if let Some(name) = p.name.as_deref() {
+            if name.trim().is_empty() {
+                return Err(invalid("session name must not be empty or whitespace"));
+            }
+            if self
                 .sessions
                 .list()
                 .await
                 .iter()
                 .any(|s| s.name.as_deref() == Some(name))
-        {
-            return Err(invalid(format!("session name '{name}' is already in use")));
+            {
+                return Err(invalid(format!("session name '{name}' is already in use")));
+            }
         }
         let policy = match p.host_key_policy.as_str() {
             "accept-new" => HostKeyPolicy::AcceptNew,
@@ -809,6 +851,49 @@ impl SshMcp {
         Ok(Json(ListServersOut {
             servers: crate::servers::list_summaries(),
             load_error: crate::servers::load_verbose().1,
+        }))
+    }
+
+    #[tool(
+        description = "Add or replace a server in ~/.ssh-pty-mcp/servers.toml (the file ssh_open(server=...) reads). Other entries are preserved; existing content keeps its encoding but is normalized to UTF-8 on write. Use this instead of hand-editing config: it validates the name and mode and keeps the file parseable. Pass overwrite=true to replace an existing entry; passwords are stored in plaintext (chmod 600 on Unix)."
+    )]
+    pub async fn ssh_add_server(
+        &self,
+        Parameters(p): Parameters<SshAddServerParams>,
+    ) -> Result<Json<AddServerOut>, McpError> {
+        crate::servers::validate_name(&p.name).map_err(invalid)?;
+        if p.host.trim().is_empty() {
+            return Err(invalid("host must not be empty"));
+        }
+        if let Some(m) = p.mode.as_deref()
+            && !matches!(m, "unrestricted" | "readonly" | "restricted")
+        {
+            return Err(invalid(format!(
+                "mode must be \"unrestricted\", \"readonly\", or \"restricted\", got '{m}'"
+            )));
+        }
+        let s = crate::servers::AddServer {
+            host: &p.host,
+            port: p.port,
+            user: p.user.as_deref(),
+            password: p.password.as_deref(),
+            private_key: p.private_key.as_deref(),
+            passphrase: p.passphrase.as_deref(),
+            proxy_jump: p.proxy_jump.as_deref(),
+            mode: p.mode.as_deref(),
+            allow: p.allow.clone(),
+        };
+        let (overwritten, path) =
+            crate::servers::add_server(&p.name, &s, p.overwrite).map_err(invalid)?;
+        self.audit.log(
+            "config",
+            "ssh_add_server",
+            serde_json::json!({"name": p.name, "path": path, "overwritten": overwritten}),
+        );
+        Ok(Json(AddServerOut {
+            name: p.name,
+            path: path.display().to_string(),
+            overwritten,
         }))
     }
 
@@ -1524,18 +1609,35 @@ impl SshMcp {
         let _io = session.io_lock.lock().await;
         let start = session.shared.inner.lock().stream.end_offset();
         let tok = format!("{:08x}", rand::random::<u32>());
-        let marker = format!("__SPM_RDY_{tok}__");
+        // Probe per shell kind: POSIX shells understand printf; PSReadLine
+        // only submits on CR and rejects printf (not a cmdlet on Windows);
+        // cmd has no printf at all (its `ver` banner is the liveness proof).
+        // Every probe keeps the needle out of the input echo so a dead shell
+        // cannot false-positive.
+        let (probe, needle) = match session.shell_kind {
+            ShellKind::Posix => (
+                format!(" printf '__SPM_RDY_%s__\\n' {tok}\n").into_bytes(),
+                format!("__SPM_RDY_{tok}").into_bytes(),
+            ),
+            ShellKind::PowerShell => (
+                format!("echo ('__SPM_RDY_' + '{tok}')\r").into_bytes(),
+                format!("__SPM_RDY_{tok}").into_bytes(),
+            ),
+            ShellKind::Cmd => (b"ver\r".to_vec(), b"Windows".to_vec()),
+            // Unknown: try the POSIX probe; a quiet fallback for exotic shells.
+            ShellKind::Unknown => (
+                format!(" printf '__SPM_RDY_%s__\\n' {tok}\n").into_bytes(),
+                format!("__SPM_RDY_{tok}").into_bytes(),
+            ),
+        };
         {
             let w = session.writer.lock().await;
-            // %s indirection: echo of this line cannot false-positive the wait.
-            w.data_bytes(format!(" printf '__SPM_RDY_%s__\\n' {tok}\n").into_bytes())
-                .await
-                .map_err(internal)?;
+            w.data_bytes(probe).await.map_err(internal)?;
         }
         let ready = session::wait_stream_contains(
             &session.shared,
             start,
-            marker.as_bytes(),
+            &needle,
             Duration::from_millis(p.probe_timeout_ms),
         )
         .await;
@@ -1550,6 +1652,14 @@ impl SshMcp {
         Parameters(p): Parameters<SshShellAsyncParams>,
     ) -> Result<Json<SshShellAsyncOut>, McpError> {
         let session = self.live_session(&p.session_id).await?;
+        // Reject upfront, like ssh_shell: a task that only errors on status
+        // poll wastes the caller's turn and hides the real reason.
+        if session.shell_kind != ShellKind::Posix {
+            return Err(invalid(format!(
+                "ssh_shell_async requires a POSIX-like shell (this session is {:?}); use ssh_exec for one-shot commands or ssh_type + ssh_expect for interactive work",
+                session.shell_kind
+            )));
+        }
         let task_id = format!("t{}", self.next_task.fetch_add(1, Ordering::SeqCst) + 1);
         let tasks = self.tasks.clone();
         let audit = self.audit.clone();
