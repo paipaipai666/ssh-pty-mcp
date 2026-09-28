@@ -9,13 +9,16 @@ programs (top/htop/less/menus), a server-side rendered terminal screen model
 with change/quiet wait semantics, expect-style pattern waits, and SFTP file
 operations guarded by a read-before-write rule.
 
+Written in Go on `golang.org/x/crypto/ssh` + `pkg/sftp` +
+`charmbracelet/x/vt` + the official MCP Go SDK. (Earlier versions were
+Rust; the full history, including the original implementation, is in git.)
+
 ## Install
 
 ```sh
-# from source
-cargo install --path .
-# or once published
-cargo install ssh-pty-mcp
+cd go
+go build -o ssh-pty-mcp .
+# put the binary on PATH, then:
 ```
 
 ## MCP client config
@@ -43,6 +46,17 @@ cargo install ssh-pty-mcp
 | `ssh_type` / `ssh_press` / `ssh_signal` | Type text, press named keys (`ctrl+c`, `f5`, `up`...), send signals |
 | `ssh_expect` / `ssh_screen` | Wait for a regex on stream/screen; read the rendered screen (full or `tail_lines`) |
 | `file_read` / `file_write` / `file_edit` / `ssh_upload` / `ssh_download` / `ssh_copy` | SFTP file ops. `file_write(overwrite)`, overwrites via `ssh_upload`/`ssh_copy`, and `file_edit` require prior read coverage — enforced |
+
+## Behavior notes
+
+- `ssh_open` reports `auth_method` for direct connections (one handshake
+  per candidate method, so the winner is known). Over tunneled ProxyJump
+  hops a single SSH handshake must carry the whole credential chain —
+  x/crypto/ssh does not say which method won — so `auth_method` reports
+  `unknown` whenever `proxy_jump` is used.
+- A timed-out `ssh_exec` closes its channel, which makes OpenSSH reap the
+  remote child — no leaked processes (the docker e2e asserts this).
+- Unknown tool arguments are ignored rather than rejected.
 
 ## Audit log
 
@@ -102,10 +116,6 @@ PowerShell, `ver` on cmd), so readiness checks work on Windows too.
 
 ## Known limitations
 
-- **ssh_exec timeout leaks the remote process.** OpenSSH does not deliver
-  signals over exec channels; when a command times out the process keeps
-  running on the remote side. Clean up with a follow-up
-  `pkill -f '<pattern>'` via `ssh_exec`.
 - **No relay mode.** The target must be reachable from this machine
   (direct or via `proxy_jump` chains — multi-hop `"a,b,c"` is supported;
   each hop may be a session alias). Targets behind strict egress firewalls
@@ -123,6 +133,19 @@ PowerShell, `ver` on cmd), so readiness checks work on Windows too.
 - **True Windows CRLF + cmd only tested logically.** The PowerShell sandbox
   (alpine + pwsh, `tests/docker/Dockerfile.win`) validates the non-POSIX
   path on LF line endings; real Windows Server hosts are not CI-covered.
+
+## Development
+
+```sh
+cd go
+go test ./...                                 # unit tests + in-process SSH e2e
+SPM_E2E=1 go test -run TestE2EDocker -v .     # full docker e2e (real sshd)
+```
+
+The docker e2e drives a real sshd (and a PowerShell container) through 39
+scenarios: shell persistence, TUI screen/press, the read-before-write guard,
+ProxyJump chains (bastion alias and open-session alias), accept-new host-key
+refusal, security modes, session limits, and the audit trail.
 
 ## Local sandbox + WAN simulation
 

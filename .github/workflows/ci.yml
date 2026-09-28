@@ -5,31 +5,38 @@ on:
     branches: [master]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  check:
-    name: fmt + clippy + unit tests
+  go:
+    name: gofmt + vet + unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+          go-version-file: go/go.mod
+      - name: gofmt check
+        working-directory: go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt: unformatted files:" $unformatted
+            exit 1
+          fi
+      - run: go vet ./...
+        working-directory: go
+      - run: go test ./...
+        working-directory: go
 
   e2e:
     name: docker end-to-end
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
       - name: E2E against real sshd in docker
-        run: SPM_E2E=1 cargo test --test ssh_e2e -- --nocapture
+        run: SPM_E2E=1 go test -run TestE2EDocker -v .
+        working-directory: go
         env:
           SPM_E2E: "1"
